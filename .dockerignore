@@ -1,0 +1,39 @@
+# Documentation
+*.md
+docs/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# Development files
+.pre-commit-config.yaml
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

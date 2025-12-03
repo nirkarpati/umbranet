@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.class
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Project specific
+*.log
+.pytest_cache/
+
+# Node.js (for frontend)
+node_modules/
+
+# React build
+frontend/build/
+frontend/dist/
+
+# Temporary files
+*.tmp
+*.temp

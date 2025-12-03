@@ -1,0 +1,14 @@
+# Minimal requirements for Docker build
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+pydantic==2.12.5
+pydantic-settings==2.2.1
+redis==5.0.8
+asyncpg==0.29.0
+neo4j==5.15.0
+httpx==0.26.0
+tenacity==8.5.0
+tiktoken==0.7.0
+openai==1.30.0
+# LangGraph for state machine workflow
+langgraph==0.0.10

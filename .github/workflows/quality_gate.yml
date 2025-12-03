@@ -1,0 +1,120 @@
+name: Quality Gate
+
+# Runs on every Pull Request as specified in Section 6.1
+on:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main, develop ]
+
+jobs:
+  quality-checks:
+    name: Code Quality & Testing
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        version: latest
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+        installer-parallel: true
+        
+    - name: Cache Poetry dependencies
+      uses: actions/cache@v3
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+        restore-keys: |
+          venv-${{ runner.os }}-${{ matrix.python-version }}-
+          
+    - name: Install Dependencies
+      run: poetry install --no-interaction --no-ansi
+      
+    - name: Lint with Ruff
+      run: |
+        echo "🔍 Running Ruff linting..."
+        poetry run ruff check .
+        
+    - name: Format check with Ruff
+      run: |
+        echo "🎨 Checking code formatting..."
+        poetry run ruff format --check .
+        
+    - name: Type Check with MyPy
+      run: |
+        echo "🔎 Running MyPy type checking..."
+        poetry run mypy src/
+        
+    - name: Run Unit Tests with Pytest
+      run: |
+        echo "🧪 Running unit tests..."
+        poetry run pytest tests/unit/ -v --tb=short --strict-markers --strict-config
+        
+    - name: Generate Test Coverage Report
+      run: |
+        echo "📊 Generating coverage report..."
+        poetry run pytest tests/unit/ --cov=src --cov-report=xml --cov-report=term-missing
+        
+    - name: Upload Coverage to Codecov
+      uses: codecov/codecov-action@v3
+      if: matrix.python-version == '3.11'
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        file: ./coverage.xml
+        fail_ci_if_error: false
+        
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+        
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        version: latest
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+        
+    - name: Install Dependencies
+      run: poetry install --no-interaction --no-ansi
+      
+    - name: Run Safety Check
+      run: |
+        echo "🔒 Running safety check for known vulnerabilities..."
+        poetry run pip list --format=freeze | poetry run safety check --stdin
+      continue-on-error: true
+      
+    - name: Run Bandit Security Linter
+      run: |
+        echo "🛡️ Running Bandit security analysis..."
+        poetry run bandit -r src/ -f json -o bandit-report.json
+      continue-on-error: true
+      
+    - name: Upload Bandit Report
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: bandit-security-report
+        path: bandit-report.json
