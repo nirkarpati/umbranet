@@ -97,6 +97,7 @@ src/
 ```
 
 NOTE **No Mock Data**: Never implement mock, simulated, fake, or dummy data - this is a real production system requiring real integrations
+\*\*never mention claude in the commit msg
 
 ## Key Architectural Concepts
 
@@ -139,3 +140,4 @@ NOTE **No Mock Data**: Never implement mock, simulated, fake, or dummy data - th
 - **Modular Design**: Atomic tools, clean interfaces, dependency injection
 - **Type Safety**: Strict typing with Pydantic models for all data structures
 - **No Mock Data**: Never implement mock, simulated, fake, or dummy data - this is a real production system requiring real integrations
+- **Never mention claude in the commit msg**

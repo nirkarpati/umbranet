@@ -18,13 +18,67 @@ interface ChatResponse {
   metadata: any;
 }
 
+const UserIdInput: React.FC<{ onSubmit: (userId: string) => void }> = ({ onSubmit }) => {
+  const [inputUserId, setInputUserId] = useState('');
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (inputUserId.trim()) {
+      onSubmit(inputUserId.trim());
+    }
+  };
+
+  return (
+    <div className="user-id-modal">
+      <div className="user-id-card">
+        <h2>🔐 Welcome to Umbranet Governor</h2>
+        <p>Enter your User ID to continue your conversation or start a new one.</p>
+        <form onSubmit={handleSubmit}>
+          <input
+            type="text"
+            value={inputUserId}
+            onChange={(e) => setInputUserId(e.target.value)}
+            placeholder="Enter your User ID (e.g., alex, john_doe, etc.)"
+            className="user-id-input"
+            autoFocus
+          />
+          <button 
+            type="submit" 
+            disabled={!inputUserId.trim()}
+            className="user-id-submit"
+          >
+            Continue
+          </button>
+        </form>
+        <div className="user-id-info">
+          <p><strong>💡 Tip:</strong> Use the same User ID to continue previous conversations.</p>
+          <p><strong>🧠 Memory:</strong> Your AI remembers everything across sessions!</p>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const App: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [userId] = useState(`user_${Date.now()}`);
+  const [userId, setUserId] = useState('');
   const [sessionId] = useState(`session_${Date.now()}`);
+  const [isUserIdSet, setIsUserIdSet] = useState(false);
+  const [showUserIdInput, setShowUserIdInput] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Initialize user ID from localStorage or show input
+  useEffect(() => {
+    const savedUserId = localStorage.getItem('umbranet_user_id');
+    if (savedUserId) {
+      setUserId(savedUserId);
+      setIsUserIdSet(true);
+    } else {
+      setShowUserIdInput(true);
+    }
+  }, []);
 
   const scrollToBottom = () => {
     if (messagesEndRef.current) {
@@ -46,7 +100,7 @@ const App: React.FC = () => {
   }, [messages]);
 
   const sendMessage = async () => {
-    if (!inputValue.trim() || isLoading) return;
+    if (!inputValue.trim() || isLoading || !isUserIdSet || !userId) return;
 
     const userMessage: Message = {
       id: Date.now(),
@@ -97,22 +151,70 @@ const App: React.FC = () => {
     }
   };
 
+  const handleUserIdSubmit = (inputUserId: string) => {
+    const trimmedUserId = inputUserId.trim();
+    if (trimmedUserId) {
+      setUserId(trimmedUserId);
+      setIsUserIdSet(true);
+      setShowUserIdInput(false);
+      localStorage.setItem('umbranet_user_id', trimmedUserId);
+    }
+  };
+
+  const handleChangeUser = () => {
+    setShowUserIdInput(true);
+    setIsUserIdSet(false);
+    setMessages([]); // Clear messages when switching users
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('umbranet_user_id');
+    setUserId('');
+    setIsUserIdSet(false);
+    setShowUserIdInput(true);
+    setMessages([]);
+  };
+
   return (
     <div className="app">
+      {showUserIdInput && (
+        <UserIdInput onSubmit={handleUserIdSubmit} />
+      )}
+      
       <header className="app-header">
-        <h1>🧠 Umbranet Governor</h1>
-        <p>Headless AI Operating System</p>
-      </header>
-
-      <div className="chat-container">
-        <div className="messages-container">
-          {messages.length === 0 && (
-            <div className="welcome-message">
-              <h3>Welcome to Umbranet Governor</h3>
-              <p>Your personal AI assistant with persistent memory across conversations.</p>
-              <p>Start typing to begin our conversation...</p>
+        <div className="header-content">
+          <div className="header-title">
+            <h1>🧠 Umbranet Governor</h1>
+            <p>Headless AI Operating System</p>
+          </div>
+          {isUserIdSet && (
+            <div className="user-controls">
+              <div className="current-user">
+                <span className="user-label">👤 {userId}</span>
+              </div>
+              <div className="user-actions">
+                <button onClick={handleChangeUser} className="change-user-btn" title="Switch User">
+                  🔄
+                </button>
+                <button onClick={handleLogout} className="logout-btn" title="Logout">
+                  🚪
+                </button>
+              </div>
             </div>
           )}
+        </div>
+      </header>
+
+      {isUserIdSet && (
+        <div className="chat-container">
+          <div className="messages-container">
+            {messages.length === 0 && (
+              <div className="welcome-message">
+                <h3>Welcome back, {userId}!</h3>
+                <p>Your personal AI assistant with persistent memory across conversations.</p>
+                <p>I remember our previous conversations. Start typing to continue...</p>
+              </div>
+            )}
 
           {messages.map((message) => (
             <div
@@ -160,13 +262,16 @@ const App: React.FC = () => {
           >
             {isLoading ? '⏳' : '📤'}
           </button>
+          </div>
         </div>
-      </div>
+      )}
 
-      <footer className="app-footer">
-        <p>User ID: {userId}</p>
-        <p>Session: {sessionId}</p>
-      </footer>
+      {isUserIdSet && (
+        <footer className="app-footer">
+          <p>Session: {sessionId}</p>
+          <p>🧠 4-Tier Memory: Redis • PostgreSQL • Neo4j • Procedural</p>
+        </footer>
+      )}
     </div>
   );
 };
