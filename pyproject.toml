@@ -4,6 +4,7 @@ version = "1.0.1"
 description = "The Headless Governor System - A stateful Personal AI Assistant Operating System"
 authors = ["Governor Team"]
 readme = "README.md"
+packages = [{include = "src"}]
 # package-mode = false  # Not supported in Poetry 1.7.1
 
 [tool.poetry.dependencies]
