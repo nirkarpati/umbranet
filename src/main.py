@@ -149,14 +149,7 @@ async def process_governor_workflow(
         existing_state.last_assistant_response = response_content
         existing_state.current_node = StateNode.IDLE  # Return to idle state
         
-        # Step 6: Store interaction in all memory tiers via memory manager
-        await store_interaction_in_memory(
-            user_id=event.user_id,
-            user_message=event.content,
-            assistant_response=response_content,
-            session_id=existing_state.session_id,
-            request_id=request_id
-        )
+        # Memory storage handled asynchronously by reflector service
         
         # Calculate processing time
         processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
@@ -218,49 +211,6 @@ CURRENT SITUATION:
 - Conversation Turn: #{state.total_turns}
 - Status: Operating in fallback mode with limited memory access"""
 
-
-async def store_interaction_in_memory(
-    user_id: str,
-    user_message: str,
-    assistant_response: str,
-    session_id: str,
-    request_id: str
-) -> None:
-    """Store interaction in all memory tiers via memory manager."""
-    global memory_manager
-    
-    if memory_manager is None:
-        logger.warning(f"⚠️  [REQ-{request_id}] Memory manager not initialized, skipping memory storage")
-        return
-    
-    try:
-        logger.debug(f"💾 [REQ-{request_id}] Storing interaction in RAG++ memory hierarchy...")
-        
-        interaction_data = {
-            "content": user_message,
-            "assistant_response": assistant_response,
-            "session_id": session_id,
-            "metadata": {
-                "request_id": request_id,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-        }
-        
-        storage_result = await memory_manager.store_interaction(user_id, interaction_data)
-        
-        # Log storage results
-        if storage_result.get("status") == "stored":
-            stored_tiers = [
-                tier for tier, status in storage_result.items()
-                if tier.endswith("_status") and status == "success"
-            ]
-            logger.info(f"✅ [REQ-{request_id}] Interaction stored in {len(stored_tiers)} memory tiers")
-        else:
-            logger.warning(f"⚠️  [REQ-{request_id}] Partial memory storage: {storage_result.get('status')}")
-            
-    except Exception as e:
-        logger.error(f"❌ [REQ-{request_id}] Failed to store interaction in memory: {e}")
-        # Continue execution even if memory storage fails
 
 
 async def generate_production_response(

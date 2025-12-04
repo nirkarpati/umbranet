@@ -56,8 +56,7 @@ class MemoryManager:
         self._health_monitor_task: Optional[asyncio.Task] = None
         self._is_initialized = False
         
-        # Memory Reflection Service integration (fast mode)
-        self._enable_fast_mode = settings.memory_fast_mode
+        # Memory Reflection Service integration
         self.queue_producer = None  # Will be initialized if needed
         
         logger.info("Memory Manager initialized with 4-tier RAG++ hierarchy")
@@ -106,15 +105,15 @@ class MemoryManager:
         )
         
         # Initialize queue producer for reflection service if enabled
-        if settings.reflection_enabled and self._enable_fast_mode:
+        if settings.reflection_enabled:
             try:
                 from ..reflector.queue.producer import get_queue_producer
                 self.queue_producer = await get_queue_producer()
                 logger.info("🚀 Memory Reflection Service queue producer initialized")
             except Exception as e:
-                logger.warning(f"⚠️ Failed to initialize reflection queue producer: {e}")
-                logger.info("📝 Falling back to traditional synchronous memory processing")
-                self._enable_fast_mode = False
+                logger.error(f"❌ Failed to initialize reflection queue producer: {e}")
+                logger.error("💥 Memory storage requires reflector service - system will not function without it")
+                raise
         
         # Start health monitoring if enabled
         if self.config.enable_health_monitoring:
@@ -161,11 +160,12 @@ class MemoryManager:
             logger.warning("Memory Manager not initialized, skipping storage")
             return {"status": "error", "reason": "not_initialized"}
         
-        # Choose processing path based on fast mode configuration
-        if self._enable_fast_mode and self.queue_producer:
-            return await self._store_interaction_fast_path(user_id, interaction, session_id)
-        else:
-            return await self._store_interaction_traditional_path(user_id, interaction, session_id)
+        # Always use fast path with reflector service
+        if not self.queue_producer:
+            logger.error("Reflector queue producer not available - memory storage requires reflector service")
+            return {"status": "error", "reason": "reflector_service_required"}
+        
+        return await self._store_interaction_fast_path(user_id, interaction, session_id)
 
     async def _store_interaction_fast_path(
         self, 
@@ -231,103 +231,21 @@ class MemoryManager:
                     "processing_time_ms": processing_time
                 }
             else:
-                logger.warning(f"⚠️ Fast path Tier 1 success but reflection queue failed - falling back")
-                # Fallback to traditional path for remaining tiers
-                return await self._store_interaction_traditional_path(user_id, interaction, session_id)
+                logger.error(f"❌ Fast path Tier 1 success but reflection queue failed")
+                return {
+                    "status": "partial_error",
+                    "interaction_id": interaction_data["interaction_id"],
+                    "timestamp": interaction_data["timestamp"],
+                    "short_term_id": tier1_result,
+                    "short_term_status": "success",
+                    "reflection_status": "failed",
+                    "processing_time_ms": processing_time
+                }
                 
         except Exception as e:
             logger.error(f"❌ Fast path failed for user {user_id}: {e}")
-            # Fallback to traditional path
-            return await self._store_interaction_traditional_path(user_id, interaction, session_id)
-
-    async def _store_interaction_traditional_path(
-        self, 
-        user_id: str, 
-        interaction: Dict[str, Any],
-        session_id: Optional[str] = None
-    ) -> Dict[str, str]:
-        """Traditional path: Store across all appropriate memory tiers synchronously."""
-        start_time = datetime.utcnow()
-        
-        # Enrich interaction data
-        interaction_data = {
-            **interaction,
-            "timestamp": start_time.isoformat(),
-            "interaction_id": f"{user_id}_{start_time.timestamp()}",
-            "user_id": user_id
-        }
-        if session_id:
-            interaction_data["session_id"] = session_id
-        
-        logger.debug(f"📝 Traditional path storage for user {user_id}: {interaction.get('content', '')[:100]}...")
-        
-        # Use tier router to decide which tiers to store in
-        from .services.memory_tier_router import create_memory_tier_router, MemoryTier
-        
-        async with await create_memory_tier_router() as router:
-            routing_result = await router.route_interaction(
-                user_message=interaction.get('content', ''),
-                assistant_response=interaction.get('assistant_response', ''),
-                user_id=user_id
-            )
-        
-        logger.info(f"🧠 Memory tier routing: {[tier.value for tier in routing_result.recommended_tiers]}")
-        for tier, reason in routing_result.reasoning.items():
-            logger.info(f"   • {tier}: {reason}")
-        
-        # Storage tasks for recommended tiers only
-        storage_tasks = []
-        storage_results = {}
-        tier_names = []
-        
-        try:
-            for tier in routing_result.recommended_tiers:
-                tier_name = tier.value
-                tier_names.append(tier_name)
-                
-                if tier == MemoryTier.SHORT_TERM:
-                    storage_tasks.append(
-                        self._store_in_tier_safe("short_term", self.short_term, user_id, interaction_data)
-                    )
-                elif tier == MemoryTier.EPISODIC:
-                    storage_tasks.append(
-                        self._store_in_tier_safe("episodic", self.episodic, user_id, interaction_data)
-                    )
-                elif tier == MemoryTier.SEMANTIC and self.config.enable_semantic_extraction:
-                    storage_tasks.append(
-                        self._store_in_tier_safe("semantic", self.semantic, user_id, interaction_data)
-                    )
-                elif tier == MemoryTier.PROCEDURAL:
-                    storage_tasks.append(
-                        self._store_in_tier_safe("procedural", self.procedural, user_id, interaction_data)
-                    )
-            
-            # Execute storage in parallel
-            results = await asyncio.gather(*storage_tasks, return_exceptions=True)
-            
-            # Process results for the tiers we actually used
-            for tier_name, result in zip(tier_names, results):
-                if isinstance(result, Exception):
-                    logger.error(f"Storage failed in {tier_name}: {result}")
-                    storage_results[f"{tier_name}_status"] = "error"
-                else:
-                    storage_results[f"{tier_name}_id"] = result
-                    storage_results[f"{tier_name}_status"] = "success"
-            
-            processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
-            
             return {
-                "status": "stored",
-                "interaction_id": interaction_data["interaction_id"],
-                "timestamp": interaction_data["timestamp"],
-                "processing_time_ms": processing_time,
-                **storage_results
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to store interaction for user {user_id}: {e}")
-            return {
-                "status": "error", 
+                "status": "error",
                 "reason": str(e),
                 "interaction_id": interaction_data.get("interaction_id")
             }
