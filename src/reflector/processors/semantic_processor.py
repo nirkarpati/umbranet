@@ -53,17 +53,12 @@ class SemanticProcessor:
                     assistant_response=job.assistant_response
                 )
                 
-                # Extract approved entities and relationships
-                entities = extraction_result.get("entities", [])
-                relationships = extraction_result.get("relationships", [])
-                
-                # Check if anything was extracted
-                if not entities and not relationships:
-                    # Nothing to store semantically
+                if extraction_result.get("skip_semantic"):
+                    # Decision to skip semantic storage entirely
                     self.success_count += 1
                     processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
                     
-                    logger.info(f"📋 Semantic storage skipped for job {job.job_id}: {extraction_result.get('reasoning', 'No permanent facts found')} in {processing_time:.1f}ms")
+                    logger.info(f"📋 Semantic storage skipped for job {job.job_id}: {extraction_result.get('reasoning', 'Pattern-based decision')} in {processing_time:.1f}ms")
                     
                     return {
                         "status": "skipped",
@@ -74,7 +69,9 @@ class SemanticProcessor:
                         "processing_time_ms": processing_time
                     }
                 
-                logger.info(f"🧠 Extracted {len(entities)} entities, {len(relationships)} relationships: {extraction_result.get('reasoning', 'No reasoning')}")
+                # Extract approved entities and relationships
+                entities = extraction_result.get("entities", [])
+                relationships = extraction_result.get("relationships", [])
                 
                 # Store in knowledge graph using existing interface
                 if entities or relationships:
@@ -123,9 +120,9 @@ class SemanticProcessor:
         existing_context = await self._get_existing_graph_context(user_id)
         recent_episodes = await self._get_recent_episodes(user_id)
         
-        # Enhanced LLM prompt for granular semantic memory extraction
+        # Enhanced LLM prompt for semantic memory curation
         pattern_detection_prompt = f"""
-You are a knowledge graph curator. Extract ONLY permanent facts and established patterns from conversations. Be granular - extract facts while ignoring temporary activities.
+You are a knowledge graph curator for a personal AI assistant. Analyze this conversation and decide what should be stored as SEMANTIC KNOWLEDGE (permanent facts in knowledge graph) vs kept only as EPISODIC MEMORY (temporary experiences).
 
 CONVERSATION:
 User: {user_message}
@@ -137,58 +134,49 @@ EXISTING SEMANTIC KNOWLEDGE:
 RECENT EPISODES (for pattern detection):
 {recent_episodes}
 
-EXTRACTION GUIDELINES:
+DECISION RULES:
+✅ SEMANTIC (store in knowledge graph):
+- Personal identifiers: names, relationships, demographic facts
+- Established preferences with clear evidence or explicit statements  
+- Factual information about people, places, organizations
+- Confirmed patterns (3+ mentions of same preference/behavior)
 
-🔥 ALWAYS EXTRACT (permanent facts):
-- Names of people with relationships: "my sister yael" → Person(Yael) + (User)-[HAS_SISTER]->(Yael)
-- Family relationships: mother, father, sister, brother, child, spouse
-- Work relationships: boss, colleague, coworker + company names  
-- Explicit preferences: "I love pizza", "I hate broccoli"
-- Personal facts: age, location, occupation, allergies
-- Established patterns: 3+ mentions of same behavior/preference
-
-⚠️ EXTRACT IF EXPLICIT ONLY:
-- Food preferences: only if stated as preference, not just consumption
-- Activity preferences: only if stated as enjoyment, not single occurrences  
-- Location preferences: only if stated as favorite/home, not visits
-
-❌ NEVER EXTRACT (temporary activities):
-- Single events: "went surfing", "had lunch", "watched movie"
-- One-time activities without preference statements
-- Temporary states or moods
-- Places visited without preference indication
+❌ EPISODIC ONLY (skip semantic storage):
+- Single events/activities without preference patterns
+- Unconfirmed preferences from isolated mentions
+- Temporary states or one-off experiences
+- Activities that don't reveal established patterns
 
 EXAMPLES:
-✅ "went surfing with my sister yael" → Person(Yael) + (User)-[HAS_SISTER]->(Yael) 
-✅ "my mom varda is 63" → Person(Varda, age:63) + (User)-[HAS_MOTHER]->(Varda)
-✅ "I love Italian food" → Food(Italian Food) + (User)-[LOVES]->(Italian Food)
-❌ "had lunch at Italian restaurant" → Extract nothing (single event, no preference)
-❌ "went to the beach" → Extract nothing (activity, not relationship/preference)
-✅ "I work at Google with my boss John" → Person(John) + Organization(Google) + relationships
+"My mom's name is Varda" → SEMANTIC (family relationship fact)
+"I love Italian food" → SEMANTIC (explicit preference)  
+"Had lunch at Italian restaurant downtown" → EPISODIC (single event, no pattern evidence)
+Third mention of enjoying Italian cuisine → SEMANTIC (pattern confirmed)
 
-Return JSON (always include entities/relationships arrays, even if empty):
+Analyze the conversation and return JSON:
 {{
+    "skip_semantic": true/false,
     "entities": [
         {{
             "name": "entity_name",
-            "type": "PERSON|ORGANIZATION|LOCATION|PREFERENCE", 
+            "type": "entity_type", 
             "confidence": 0.8,
-            "properties": {{"age": "number", "role": "string"}}
+            "properties": {{"key": "value"}}
         }}
     ],
     "relationships": [
         {{
-            "from_entity": "User",
+            "from_entity": "entity_name",
             "to_entity": "entity_name",
-            "relationship": "HAS_SISTER|HAS_MOTHER|WORKS_AT|LOVES|HATES",
-            "confidence": 0.9,
-            "properties": {{"since": "date"}}
+            "relationship": "relationship_type",
+            "confidence": 0.9
         }}
     ],
-    "reasoning": "What was extracted and why certain activities were ignored"
+    "reasoning": "Explanation of decision - why semantic storage or episodic only"
 }}
 
-Extract permanent facts, ignore temporary activities. Be granular - relationships matter more than activities.
+If skip_semantic is true, return empty entities and relationships arrays.
+Focus on permanent facts and established patterns, not temporary experiences.
 """
         
         try:
@@ -288,6 +276,7 @@ Extract permanent facts, ignore temporary activities. Be granular - relationship
             )
             
             return {
+                "skip_semantic": False,
                 "entities": [{"name": e.name, "type": e.entity_type.value, "confidence": 0.7} for e in extraction_result.entities],
                 "relationships": [{"from_entity": e.from_entity_id, "to_entity": e.to_entity_id, "relationship": e.relationship_type.value, "confidence": 0.7} for e in extraction_result.relationships],
                 "reasoning": "Fallback to full extraction due to pattern detection failure"
@@ -295,6 +284,7 @@ Extract permanent facts, ignore temporary activities. Be granular - relationship
         except Exception as e:
             logger.error(f"Fallback extraction also failed: {e}")
             return {
+                "skip_semantic": True,
                 "entities": [],
                 "relationships": [],
                 "reasoning": f"Both pattern detection and fallback extraction failed: {e}"
@@ -393,7 +383,6 @@ Extract permanent facts, ignore temporary activities. Be granular - relationship
                 
                 # Store relationship
                 await self.semantic_store.upsert_relationship(
-                    user_id=user_id,
                     from_entity_id=from_entity_id,
                     to_entity_id=to_entity_id,
                     relationship_type=relationship_type,
