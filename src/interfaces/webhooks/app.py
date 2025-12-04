@@ -498,6 +498,24 @@ class WebhookApp:
             # Send response back to user
             await self._send_response(response, event.channel)
             
+            # Store interaction in memory (triggers reflection job)
+            try:
+                if self.memory_manager:
+                    await self.memory_manager.store_interaction(
+                        user_id=event.user_id,
+                        interaction={
+                            "content": event.content,
+                            "assistant_response": response.get("response", ""),
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "session_id": event.session_id,
+                            "metadata": event.metadata or {}
+                        },
+                        session_id=event.session_id
+                    )
+                    logger.debug(f"✅ Webhook interaction stored and reflection job queued for {event.user_id}")
+            except Exception as e:
+                logger.error(f"❌ Webhook memory storage failed for {event.user_id}: {e}")
+            
             # Update session state
             state.total_turns += 1
             session_states[event.session_id] = state

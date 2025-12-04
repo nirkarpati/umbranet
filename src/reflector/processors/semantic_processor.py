@@ -153,6 +153,23 @@ EXAMPLES:
 "Had lunch at Italian restaurant downtown" → EPISODIC (single event, no pattern evidence)
 Third mention of enjoying Italian cuisine → SEMANTIC (pattern confirmed)
 
+RELATIONSHIP TYPES - Use specific, meaningful relationship names from these categories:
+Family: HAS_MOTHER, HAS_FATHER, HAS_SIBLING, HAS_CHILD, HAS_SPOUSE, HAS_PARTNER
+Work: WORKS_AT, MANAGES, REPORTS_TO, COLLEAGUE_OF
+Location: LIVES_IN, BORN_IN, VISITED, WORKS_IN, STUDIED_IN
+Preferences: LIKES, DISLIKES, PREFERS, ENJOYS, AVOIDS, LOVES, HATES
+Skills: HAS_SKILL, KNOWS_ABOUT, EXPERT_IN, LEARNING, TAUGHT_BY
+Social: KNOWS, FRIEND_OF, MENTOR_OF, STUDENT_OF
+Ownership: OWNS, HAS_GOAL, HAS_ALLERGY
+General: RELATED_TO, PART_OF, ASSOCIATED_WITH, MENTIONED_IN
+
+Examples:
+"My sister Tal" → HAS_SIBLING (Ben → HAS_SIBLING → Tal)
+"Tal loves cooking" → ENJOYS (Tal → ENJOYS → cooking)
+"I work at Google" → WORKS_AT (User → WORKS_AT → Google)
+
+Choose the MOST SPECIFIC relationship type. Avoid generic RELATED_TO unless no specific type applies.
+
 Analyze the conversation and return JSON:
 {{
     "skip_semantic": true/false,
@@ -167,8 +184,8 @@ Analyze the conversation and return JSON:
     "relationships": [
         {{
             "from_entity": "entity_name",
-            "to_entity": "entity_name",
-            "relationship": "relationship_type",
+            "to_entity": "entity_name", 
+            "relationship": "specific_relationship_type",
             "confidence": 0.9
         }}
     ],
@@ -383,6 +400,7 @@ Focus on permanent facts and established patterns, not temporary experiences.
                 
                 # Store relationship
                 await self.semantic_store.upsert_relationship(
+                    user_id=user_id,
                     from_entity_id=from_entity_id,
                     to_entity_id=to_entity_id,
                     relationship_type=relationship_type,
