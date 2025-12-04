@@ -12,3 +12,5 @@ tiktoken==0.7.0
 openai==1.30.0
 # LangGraph for state machine workflow
 langgraph==0.0.10
+# Message Queue (RabbitMQ) for Memory Reflection Service
+aio-pika==9.4.3

@@ -27,6 +27,8 @@ openai = "^1.10.0"
 sentence-transformers = "^2.2.0"
 # HTTP client with retry support
 tenacity = "^8.2.0"
+# Message Queue (RabbitMQ) for Memory Reflection Service
+aio-pika = "^9.4.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"

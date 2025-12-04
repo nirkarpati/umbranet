@@ -77,6 +77,56 @@ class Settings(BaseSettings):
         description="Twilio authentication token",
     )
 
+    # RabbitMQ Configuration (Message Queue for Memory Reflection)
+    rabbitmq_url: str = Field(
+        default="amqp://umbranet:reflection123@rabbitmq:5672/",
+        description="RabbitMQ connection URL",
+    )
+    rabbitmq_exchange: str = Field(
+        default="memory_reflection_exchange",
+        description="RabbitMQ exchange for memory reflection jobs",
+    )
+    rabbitmq_queue: str = Field(
+        default="memory_reflection_queue",
+        description="Main queue for memory reflection jobs",
+    )
+    rabbitmq_dead_letter_queue: str = Field(
+        default="memory_reflection_dlq",
+        description="Dead letter queue for failed reflection jobs",
+    )
+
+    # Memory Reflection Service Configuration
+    reflection_enabled: bool = Field(
+        default=True,
+        description="Enable asynchronous memory reflection processing",
+    )
+    reflection_batch_size: int = Field(
+        default=10,
+        description="Number of reflection jobs to process in batch",
+    )
+    reflection_workers: int = Field(
+        default=2,
+        description="Number of concurrent reflection workers",
+    )
+    reflection_max_retries: int = Field(
+        default=3,
+        description="Maximum retry attempts for failed reflection jobs",
+    )
+    reflection_retry_delay: int = Field(
+        default=30,
+        description="Base delay in seconds between retry attempts",
+    )
+
+    # Performance Configuration
+    memory_fast_mode: bool = Field(
+        default=True,
+        description="Enable fast mode: only Tier 1 during chat, queue reflection",
+    )
+    reflection_timeout: int = Field(
+        default=300,
+        description="Maximum time in seconds for reflection processing",
+    )
+
     # FastAPI Configuration
     fastapi_host: str = "0.0.0.0"
     fastapi_port: int = 8000

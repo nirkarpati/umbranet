@@ -56,6 +56,10 @@ class MemoryManager:
         self._health_monitor_task: Optional[asyncio.Task] = None
         self._is_initialized = False
         
+        # Memory Reflection Service integration (fast mode)
+        self._enable_fast_mode = settings.memory_fast_mode
+        self.queue_producer = None  # Will be initialized if needed
+        
         logger.info("Memory Manager initialized with 4-tier RAG++ hierarchy")
     
     def _create_default_config(self) -> MemoryConfig:
@@ -101,6 +105,17 @@ class MemoryManager:
             f"({initialization_time:.3f}s)"
         )
         
+        # Initialize queue producer for reflection service if enabled
+        if settings.reflection_enabled and self._enable_fast_mode:
+            try:
+                from ..reflector.queue.producer import get_queue_producer
+                self.queue_producer = await get_queue_producer()
+                logger.info("🚀 Memory Reflection Service queue producer initialized")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to initialize reflection queue producer: {e}")
+                logger.info("📝 Falling back to traditional synchronous memory processing")
+                self._enable_fast_mode = False
+        
         # Start health monitoring if enabled
         if self.config.enable_health_monitoring:
             self._health_monitor_task = asyncio.create_task(self._health_monitor_loop())
@@ -123,16 +138,21 @@ class MemoryManager:
     async def store_interaction(
         self, 
         user_id: str, 
-        interaction: Dict[str, Any]
+        interaction: Dict[str, Any],
+        session_id: Optional[str] = None
     ) -> Dict[str, str]:
         """Store interaction across all appropriate memory tiers.
         
         This is the main entry point for storing user interactions. The interaction
         is processed and stored in multiple tiers based on its content and type.
         
+        With fast mode enabled, only Tier 1 (Redis) is processed synchronously,
+        while Tiers 2, 3, 4 are processed asynchronously via reflection queue.
+        
         Args:
             user_id: User identifier
             interaction: Interaction data containing content, metadata, etc.
+            session_id: Optional session identifier for conversation tracking
             
         Returns:
             Dictionary with storage results and identifiers
@@ -141,15 +161,105 @@ class MemoryManager:
             logger.warning("Memory Manager not initialized, skipping storage")
             return {"status": "error", "reason": "not_initialized"}
         
+        # Choose processing path based on fast mode configuration
+        if self._enable_fast_mode and self.queue_producer:
+            return await self._store_interaction_fast_path(user_id, interaction, session_id)
+        else:
+            return await self._store_interaction_traditional_path(user_id, interaction, session_id)
+
+    async def _store_interaction_fast_path(
+        self, 
+        user_id: str, 
+        interaction: Dict[str, Any],
+        session_id: Optional[str] = None
+    ) -> Dict[str, str]:
+        """Fast path: Store only Tier 1 (Redis) synchronously, queue reflection job for other tiers."""
+        start_time = datetime.utcnow()
+        
         # Enrich interaction data
         interaction_data = {
             **interaction,
-            "timestamp": datetime.utcnow().isoformat(),
-            "interaction_id": f"{user_id}_{datetime.utcnow().timestamp()}",
+            "timestamp": start_time.isoformat(),
+            "interaction_id": f"{user_id}_{start_time.timestamp()}",
             "user_id": user_id
         }
+        if session_id:
+            interaction_data["session_id"] = session_id
         
-        logger.debug(f"📝 Storing interaction for user {user_id}: {interaction.get('content', '')[:100]}...")
+        logger.debug(f"⚡ Fast path storage for user {user_id}: {interaction.get('content', '')[:100]}...")
+        
+        try:
+            # Store in Tier 1 (Redis) immediately for chat context
+            tier1_result = await self._store_in_tier_safe(
+                "short_term", 
+                self.short_term, 
+                user_id, 
+                interaction_data
+            )
+            
+            # Queue reflection job for Tiers 2, 3, 4
+            from ..reflector.queue.schemas import MemoryReflectionJob, ReflectionPriority
+            
+            priority = self._determine_reflection_priority(interaction)
+            
+            reflection_job = MemoryReflectionJob(
+                job_id=f"reflection_{interaction_data['interaction_id']}",
+                user_id=user_id,
+                session_id=session_id,
+                user_message=interaction.get('content', ''),
+                assistant_response=interaction.get('assistant_response', ''),
+                timestamp=start_time,
+                priority=priority,
+                metadata=interaction.get('metadata', {})
+            )
+            
+            # Send to reflection queue
+            queue_success = await self.queue_producer.send_reflection_job(reflection_job)
+            
+            processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+            
+            if queue_success:
+                logger.info(f"⚡ Fast path completed in {processing_time:.1f}ms - reflection job queued")
+                return {
+                    "status": "stored_fast",
+                    "interaction_id": interaction_data["interaction_id"],
+                    "timestamp": interaction_data["timestamp"],
+                    "short_term_id": tier1_result,
+                    "short_term_status": "success",
+                    "reflection_job_id": reflection_job.job_id,
+                    "reflection_status": "queued",
+                    "processing_time_ms": processing_time
+                }
+            else:
+                logger.warning(f"⚠️ Fast path Tier 1 success but reflection queue failed - falling back")
+                # Fallback to traditional path for remaining tiers
+                return await self._store_interaction_traditional_path(user_id, interaction, session_id)
+                
+        except Exception as e:
+            logger.error(f"❌ Fast path failed for user {user_id}: {e}")
+            # Fallback to traditional path
+            return await self._store_interaction_traditional_path(user_id, interaction, session_id)
+
+    async def _store_interaction_traditional_path(
+        self, 
+        user_id: str, 
+        interaction: Dict[str, Any],
+        session_id: Optional[str] = None
+    ) -> Dict[str, str]:
+        """Traditional path: Store across all appropriate memory tiers synchronously."""
+        start_time = datetime.utcnow()
+        
+        # Enrich interaction data
+        interaction_data = {
+            **interaction,
+            "timestamp": start_time.isoformat(),
+            "interaction_id": f"{user_id}_{start_time.timestamp()}",
+            "user_id": user_id
+        }
+        if session_id:
+            interaction_data["session_id"] = session_id
+        
+        logger.debug(f"📝 Traditional path storage for user {user_id}: {interaction.get('content', '')[:100]}...")
         
         # Use tier router to decide which tiers to store in
         from .services.memory_tier_router import create_memory_tier_router, MemoryTier
@@ -204,10 +314,13 @@ class MemoryManager:
                     storage_results[f"{tier_name}_id"] = result
                     storage_results[f"{tier_name}_status"] = "success"
             
+            processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+            
             return {
                 "status": "stored",
                 "interaction_id": interaction_data["interaction_id"],
                 "timestamp": interaction_data["timestamp"],
+                "processing_time_ms": processing_time,
                 **storage_results
             }
             
@@ -218,6 +331,35 @@ class MemoryManager:
                 "reason": str(e),
                 "interaction_id": interaction_data.get("interaction_id")
             }
+
+    def _determine_reflection_priority(self, interaction: Dict[str, Any]) -> Any:
+        """Determine priority for reflection job based on interaction content."""
+        from ..reflector.queue.schemas import ReflectionPriority
+        
+        # Simple heuristic - can be enhanced with ML models later
+        content = interaction.get('content', '').lower()
+        assistant_response = interaction.get('assistant_response', '').lower()
+        
+        # High priority indicators
+        high_priority_keywords = [
+            'urgent', 'important', 'critical', 'emergency', 'deadline',
+            'meeting', 'appointment', 'remind', 'schedule', 'calendar'
+        ]
+        
+        # Low priority indicators  
+        low_priority_keywords = [
+            'hello', 'hi', 'thanks', 'thank you', 'bye', 'goodbye',
+            'test', 'testing', 'just checking'
+        ]
+        
+        combined_text = f"{content} {assistant_response}"
+        
+        if any(keyword in combined_text for keyword in high_priority_keywords):
+            return ReflectionPriority.HIGH
+        elif any(keyword in combined_text for keyword in low_priority_keywords):
+            return ReflectionPriority.LOW
+        else:
+            return ReflectionPriority.NORMAL
     
     async def _store_in_tier_safe(
         self, 

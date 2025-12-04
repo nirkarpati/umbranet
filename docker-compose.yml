@@ -119,6 +119,63 @@ services:
       timeout: 5s
       retries: 5
 
+  # Message Queue (RabbitMQ) - For Memory Reflection Service
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: umbranet-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: umbranet
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-reflection123}
+      RABBITMQ_DEFAULT_VHOST: /
+    ports:
+      - "5672:5672"      # AMQP port
+      - "15672:15672"    # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - umbranet
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Memory Reflector Service - Asynchronous Memory Processing
+  memory-reflector:
+    build:
+      context: .
+      dockerfile: docker/Reflector.Dockerfile
+    container_name: umbranet-memory-reflector
+    environment:
+      - ENVIRONMENT=development
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=governor
+      - POSTGRES_PASSWORD=dev_password
+      - POSTGRES_DB=governor_memory
+      - NEO4J_URL=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=dev_password
+      - RABBITMQ_URL=amqp://umbranet:reflection123@rabbitmq:5672/
+      - LOG_LEVEL=INFO
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    networks:
+      - umbranet
+    restart: unless-stopped
+    volumes:
+      - ./src:/app/src  # Hot reload for development
+
 # Named volumes for data persistence
 volumes:
   postgres_data:
@@ -126,6 +183,8 @@ volumes:
   neo4j_data:
     driver: local
   redis_data:
+    driver: local
+  rabbitmq_data:
     driver: local
 
 # Network for service communication
