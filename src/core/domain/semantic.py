@@ -26,6 +26,7 @@ class EntityType(str, Enum):
     SKILL = "Skill"
     GOAL = "Goal"
     TASK = "Task"
+    FOOD = "Food"
     
     # Flexible catch-all for new entity types
     ENTITY = "Entity"
@@ -34,15 +35,51 @@ class EntityType(str, Enum):
 class RelationshipType(str, Enum):
     """Relationship types with semantic meaning."""
     
-    # User-centric relationships
+    # Family relationships
+    HAS_MOTHER = "HAS_MOTHER"
+    HAS_FATHER = "HAS_FATHER"
+    HAS_SIBLING = "HAS_SIBLING"
+    HAS_CHILD = "HAS_CHILD"
+    HAS_SPOUSE = "HAS_SPOUSE"
+    HAS_PARTNER = "HAS_PARTNER"
+    
+    # Work relationships
+    WORKS_AT = "WORKS_AT"
+    MANAGES = "MANAGES"
+    REPORTS_TO = "REPORTS_TO"
+    COLLEAGUE_OF = "COLLEAGUE_OF"
+    
+    # Location relationships
+    LIVES_IN = "LIVES_IN"
+    BORN_IN = "BORN_IN"
+    VISITED = "VISITED"
+    WORKS_IN = "WORKS_IN"
+    STUDIED_IN = "STUDIED_IN"
+    
+    # Preferences and interests
     LIKES = "LIKES"
     DISLIKES = "DISLIKES"
     PREFERS = "PREFERS"
-    OWNS = "OWNS"
-    KNOWS = "KNOWS"
-    WORKS_AT = "WORKS_AT"
-    LIVES_IN = "LIVES_IN"
+    ENJOYS = "ENJOYS"
+    AVOIDS = "AVOIDS"
+    LOVES = "LOVES"
+    HATES = "HATES"
+    
+    # Skills and knowledge
     HAS_SKILL = "HAS_SKILL"
+    KNOWS_ABOUT = "KNOWS_ABOUT"
+    EXPERT_IN = "EXPERT_IN"
+    LEARNING = "LEARNING"
+    TAUGHT_BY = "TAUGHT_BY"
+    
+    # Social connections
+    KNOWS = "KNOWS"
+    FRIEND_OF = "FRIEND_OF"
+    MENTOR_OF = "MENTOR_OF"
+    STUDENT_OF = "STUDENT_OF"
+    
+    # Ownership and possession
+    OWNS = "OWNS"
     HAS_GOAL = "HAS_GOAL"
     HAS_ALLERGY = "HAS_ALLERGY"
     

@@ -156,13 +156,13 @@ class Neo4jConnection:
             "FOR (s:SystemAgent) REQUIRE s.entity_id IS UNIQUE",
             
             # Index on user_id for fast tenant filtering
-            "CREATE INDEX user_id_index IF NOT EXISTS FOR (n) ON (n.user_id)",
+            "CREATE INDEX user_id_index IF NOT EXISTS FOR (n:User) ON (n.user_id)",
             
             # Index on entity names for text searches
-            "CREATE INDEX entity_name_index IF NOT EXISTS FOR (n) ON (n.name)",
+            "CREATE INDEX entity_name_index IF NOT EXISTS FOR (n:Entity) ON (n.name)",
             
-            # Index on relationship weights for filtering
-            "CREATE INDEX relationship_weight_index IF NOT EXISTS FOR ()-[r]-() ON (r.weight)"
+            # Index on relationship weights for filtering  
+            "CREATE INDEX relationship_weight_index IF NOT EXISTS FOR ()-[r:RELATES_TO]-() ON (r.weight)"
         ]
         
         try:

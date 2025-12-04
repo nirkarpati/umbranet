@@ -437,6 +437,81 @@ class SemanticMemoryStore:
             logger.error(f"Failed to get graph stats: {str(e)}")
             return GraphStats()
     
+    async def get_entities_for_user(self, user_id: str) -> list[dict]:
+        """Get all entities for a user.
+        
+        Args:
+            user_id: User identifier
+            
+        Returns:
+            List of entity dictionaries
+        """
+        if not self.neo4j:
+            raise SemanticMemoryError("Store not connected")
+        
+        try:
+            query = """
+            MATCH (n {user_id: $user_id})
+            RETURN n.name as name, 
+                   COALESCE(n.original_type, n.type, labels(n)[0]) as type, 
+                   n.entity_id as entity_id,
+                   n.properties as properties
+            ORDER BY n.created_at DESC
+            """
+            
+            results = await self.neo4j.execute_query(query, {"user_id": user_id})
+            formatted_results = []
+            for result in results:
+                formatted_results.append({
+                    "name": result.get("name"),
+                    "type": result.get("type"),
+                    "entity_id": result.get("entity_id")
+                })
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"Failed to get entities for user {user_id}: {str(e)}")
+            return []
+    
+    async def get_relationships_for_user(self, user_id: str) -> list[dict]:
+        """Get all relationships for a user.
+        
+        Args:
+            user_id: User identifier
+            
+        Returns:
+            List of relationship dictionaries
+        """
+        if not self.neo4j:
+            raise SemanticMemoryError("Store not connected")
+        
+        try:
+            query = """
+            MATCH (a {user_id: $user_id})-[r]->(b {user_id: $user_id})
+            RETURN type(r) as relationship_type, 
+                   COALESCE(r.original_relationship, type(r)) as display_relationship,
+                   a.name as from_entity, 
+                   b.name as to_entity, 
+                   r.weight as weight,
+                   r.properties as properties
+            ORDER BY r.weight DESC
+            """
+            
+            results = await self.neo4j.execute_query(query, {"user_id": user_id})
+            formatted_results = []
+            for result in results:
+                formatted_results.append({
+                    "relationship_type": result.get("display_relationship", result.get("relationship_type")),
+                    "from_entity": result.get("from_entity"),
+                    "to_entity": result.get("to_entity"),
+                    "weight": result.get("weight", 0.5)
+                })
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"Failed to get relationships for user {user_id}: {str(e)}")
+            return []
+
     async def delete_user_graph(self, user_id: str) -> int:
         """Delete all graph data for a user.
         

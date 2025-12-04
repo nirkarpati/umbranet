@@ -140,4 +140,5 @@ NOTE **No Mock Data**: Never implement mock, simulated, fake, or dummy data - th
 - **Modular Design**: Atomic tools, clean interfaces, dependency injection
 - **Type Safety**: Strict typing with Pydantic models for all data structures
 - **No Mock Data**: Never implement mock, simulated, fake, or dummy data - this is a real production system requiring real integrations
-- **Never mention claude in the commit msg**
+- **Never mention claude in the commit msg**: Never include any references to AI, coding agents, assistants, or automated generation in commit messages. Keep commit messages professional and focused on the technical changes only.
+- **Never commit and push without explicit user request**: Only perform git commits and pushes when the user explicitly asks you to do so

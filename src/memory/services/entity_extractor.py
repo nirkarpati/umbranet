@@ -171,12 +171,53 @@ class EntityExtractor:
         
         return relationships
     
+    async def _get_existing_graph_context(self, user_id: str) -> str:
+        """Get a sample of existing entities and relationships for context consistency."""
+        try:
+            from ..tiers.semantic import SemanticMemoryStore
+            
+            # Get a sample of existing graph data
+            async with SemanticMemoryStore() as semantic_store:
+                entities = await semantic_store.get_entities_for_user(user_id)
+                relationships = await semantic_store.get_relationships_for_user(user_id)
+            
+            if not entities and not relationships:
+                return "No existing graph data - this is the first extraction for this user."
+            
+            # Format sample data for context
+            context_parts = []
+            
+            if entities:
+                sample_entities = entities[:5]  # Show up to 5 entities
+                context_parts.append("EXISTING ENTITIES:")
+                for entity in sample_entities:
+                    entity_type = entity.get('type', 'Unknown')
+                    entity_name = entity.get('name', 'Unknown')
+                    properties = entity.get('properties', {})
+                    prop_str = ", ".join([f"{k}:{v}" for k, v in properties.items() if k not in ['extraction_method', 'confidence']])
+                    context_parts.append(f"- {entity_type}({entity_name}" + (f", {prop_str}" if prop_str else "") + ")")
+            
+            if relationships:
+                sample_rels = relationships[:5]  # Show up to 5 relationships
+                context_parts.append("\nEXISTING RELATIONSHIPS:")
+                for rel in sample_rels:
+                    from_entity = rel.get('from_entity', 'Unknown')
+                    to_entity = rel.get('to_entity', 'Unknown')
+                    rel_type = rel.get('relationship_type', 'UNKNOWN')
+                    context_parts.append(f"- ({from_entity})-[{rel_type}]->({to_entity})")
+            
+            return "\n".join(context_parts)
+            
+        except Exception as e:
+            logger.warning(f"Failed to get existing graph context for user {user_id}: {e}")
+            return "Unable to retrieve existing graph context - proceeding with fresh extraction."
+    
     async def _extract_entities_llm(
         self, 
         text: str, 
         user_id: str
     ) -> EntityExtractionResult:
-        """Extract entities using LLM with structured prompting."""
+        """Extract entities using LLM with context-aware structured prompting."""
         if not settings.openai_api_key:
             # Fall back to rule-based extraction
             entities = self._extract_entities_rule_based(text, user_id)
@@ -187,40 +228,56 @@ class EntityExtractor:
                 confidence=0.6
             )
         
-        # LLM-based extraction prompt
+        # Get existing graph context for consistency
+        existing_context = await self._get_existing_graph_context(user_id)
+        
+        # Enhanced LLM-based extraction prompt with context awareness
         extraction_prompt = f"""
-Analyze the following conversation text and extract semantic entities and relationships for knowledge graph construction.
+You are an expert knowledge graph extractor. Analyze the conversation and extract meaningful semantic entities and relationships.
 
-TEXT: {text}
+CONVERSATION TEXT: {text}
 
-Extract:
-1. ENTITIES: People, places, organizations, concepts, preferences, skills, goals
-2. RELATIONSHIPS: How entities connect (likes, works_at, lives_in, knows, etc.)
+EXISTING GRAPH CONTEXT (learn from these patterns for consistency):
+{existing_context}
 
-For the user (speaker), create relationships showing their preferences, connections, and attributes.
+EXTRACTION GUIDELINES:
+1. Create SPECIFIC and MEANINGFUL relationship types - avoid generic terms like "RELATED_TO"
+2. Use descriptive entity types that capture the essence of what you're describing
+3. Include relevant properties/attributes for entities (age, role, location, etc.)
+4. Make relationships bidirectional when it makes sense
+5. Use natural, human-readable relationship names
+
+GOOD EXTRACTION EXAMPLES:
+- "My mom Varda is 63" → Entities: Person(Varda, age:63), Person(User) + Relationship: (User)-[HAS_MOTHER]->(Varda)
+- "I work at Google as a software engineer" → Entities: Person(User, role:"software engineer"), Organization(Google) + Relationship: (User)-[WORKS_AT]->(Google)
+- "I love pizza and hate broccoli" → Entities: Food(Pizza), Food(Broccoli) + Relationships: (User)-[LOVES]->(Pizza), (User)-[HATES]->(Broccoli)
+- "My dog Max is a Golden Retriever" → Entities: Pet(Max, breed:"Golden Retriever") + Relationship: (User)-[OWNS]->(Max)
+
+Be creative but consistent with existing patterns. Entity types can be: Person, Location, Organization, Food, Pet, Hobby, Skill, Goal, Event, Product, Concept, etc.
+Relationship types can be: HAS_MOTHER, WORKS_AT, LIVES_IN, LOVES, HATES, OWNS, FRIEND_OF, STUDIED_AT, BORN_IN, etc.
 
 Return JSON format:
 {{
     "entities": [
         {{
             "name": "entity_name",
-            "type": "Person|Location|Organization|Concept|Preference|Skill|Goal|Product",
-            "confidence": 0.0-1.0,
-            "properties": {{"key": "value"}}
+            "type": "flexible_entity_type",
+            "confidence": 0.7-1.0,
+            "properties": {{"key": "value", "age": "number", "description": "string"}}
         }}
     ],
     "relationships": [
         {{
             "from_entity": "entity_name",
             "to_entity": "entity_name", 
-            "relationship": "LIKES|DISLIKES|WORKS_AT|LIVES_IN|KNOWS|HAS_SKILL|etc",
-            "confidence": 0.0-1.0,
-            "properties": {{"key": "value"}}
+            "relationship": "meaningful_relationship_name",
+            "confidence": 0.7-1.0,
+            "properties": {{"since": "date", "strength": "string", "notes": "string"}}
         }}
     ]
 }}
 
-Focus on factual, actionable information. Avoid speculation.
+Focus on creating a rich, meaningful knowledge graph. Use "User" as the entity name for the speaker.
 """
         
         try:
@@ -242,37 +299,91 @@ Focus on factual, actionable information. Avoid speculation.
             entities = []
             relationships = []
             
-            # Process entities
+            # Process entities with flexible typing
             for entity_data in data.get("entities", []):
+                entity_type_str = entity_data.get("type", "Entity")
+                
+                # Try to match to existing EntityType enum, otherwise use ENTITY as fallback
                 try:
-                    entity_type = EntityType(entity_data["type"])
+                    entity_type = EntityType(entity_type_str)
                 except ValueError:
-                    entity_type = EntityType.ENTITY  # Default fallback
+                    # For flexible entity types, try common mappings
+                    type_mapping = {
+                        "pet": EntityType.ENTITY,
+                        "hobby": EntityType.CONCEPT,
+                        "food": EntityType.PRODUCT,
+                        "animal": EntityType.ENTITY,
+                        "vehicle": EntityType.PRODUCT,
+                        "book": EntityType.PRODUCT,
+                        "movie": EntityType.PRODUCT,
+                        "song": EntityType.PRODUCT,
+                        "company": EntityType.ORGANIZATION,
+                        "school": EntityType.ORGANIZATION,
+                        "university": EntityType.ORGANIZATION,
+                        "city": EntityType.LOCATION,
+                        "country": EntityType.LOCATION,
+                        "state": EntityType.LOCATION
+                    }
+                    entity_type = type_mapping.get(entity_type_str.lower(), EntityType.ENTITY)
                 
                 entity_id = self._generate_entity_id(
                     user_id, entity_data["name"], entity_type
                 )
+                
+                # Store original type string in properties for flexibility
+                properties = {
+                    **entity_data.get("properties", {}),
+                    "extraction_method": "llm",
+                    "confidence": entity_data.get("confidence", 0.7),
+                    "original_type": entity_type_str  # Preserve LLM's original type
+                }
                 
                 entities.append(GraphEntity(
                     entity_id=entity_id,
                     entity_type=entity_type,
                     name=entity_data["name"],
                     user_id=user_id,
-                    properties={
-                        **entity_data.get("properties", {}),
-                        "extraction_method": "llm",
-                        "confidence": entity_data.get("confidence", 0.7)
-                    }
+                    properties=properties
                 ))
             
             # Process relationships
             user_entity_id = self._generate_entity_id(user_id, "User", EntityType.USER)
             
             for rel_data in data.get("relationships", []):
+                relationship_str = rel_data.get("relationship", "RELATED_TO")
+                
+                # Try to match to existing RelationshipType enum, otherwise use RELATED_TO as fallback
                 try:
-                    relationship_type = RelationshipType(rel_data["relationship"])
+                    relationship_type = RelationshipType(relationship_str)
                 except ValueError:
-                    relationship_type = RelationshipType.RELATED_TO  # Default fallback
+                    # For flexible relationship types, try common mappings
+                    relationship_mapping = {
+                        # Family
+                        "has_mother": RelationshipType.HAS_MOTHER,
+                        "has_father": RelationshipType.HAS_FATHER,
+                        "has_child": RelationshipType.HAS_CHILD,
+                        "has_sibling": RelationshipType.HAS_SIBLING,
+                        # Work
+                        "works_at": RelationshipType.WORKS_AT,
+                        "colleague_of": RelationshipType.COLLEAGUE_OF,
+                        # Preferences  
+                        "likes": RelationshipType.LIKES,
+                        "loves": RelationshipType.LOVES,
+                        "hates": RelationshipType.HATES,
+                        "dislikes": RelationshipType.DISLIKES,
+                        # Locations
+                        "lives_in": RelationshipType.LIVES_IN,
+                        "born_in": RelationshipType.BORN_IN,
+                        # Social
+                        "friend_of": RelationshipType.FRIEND_OF,
+                        "knows": RelationshipType.KNOWS,
+                        # Skills
+                        "expert_in": RelationshipType.EXPERT_IN,
+                        "has_skill": RelationshipType.HAS_SKILL,
+                        # Ownership
+                        "owns": RelationshipType.OWNS
+                    }
+                    relationship_type = relationship_mapping.get(relationship_str.lower(), RelationshipType.RELATED_TO)
                 
                 # Find entity IDs
                 from_name = rel_data["from_entity"]
@@ -317,6 +428,14 @@ Focus on factual, actionable information. Avoid speculation.
                     to_entity_id = to_entity.entity_id
                 
                 confidence = rel_data.get("confidence", 0.7)
+                
+                # Preserve the original relationship string for flexibility
+                relationship_properties = {
+                    **rel_data.get("properties", {}),
+                    "extraction_method": "llm",
+                    "original_relationship": relationship_str  # Store LLM's original relationship name
+                }
+                
                 relationships.append(GraphRelationship(
                     from_entity_id=from_entity_id,
                     to_entity_id=to_entity_id,
@@ -324,13 +443,11 @@ Focus on factual, actionable information. Avoid speculation.
                     weight=confidence,
                     decay_rate=0.01 if relationship_type in [
                         RelationshipType.HAS_ALLERGY, 
-                        RelationshipType.DISLIKES
+                        RelationshipType.DISLIKES,
+                        RelationshipType.HATES
                     ] else 0.02,
                     user_id=user_id,
-                    properties={
-                        **rel_data.get("properties", {}),
-                        "extraction_method": "llm"
-                    }
+                    properties=relationship_properties
                 ))
             
             return EntityExtractionResult(

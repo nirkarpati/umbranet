@@ -349,3 +349,33 @@ class ShortTermMemoryClient:
             "last_updated": context.last_updated.isoformat(),
             "summary_length": len(context.summary) if context.summary else 0
         }
+    
+    async def get_session_data(self, user_id: str) -> dict[str, Any]:
+        """Get session data for a user for memory dashboard.
+        
+        Args:
+            user_id: User identifier
+            
+        Returns:
+            Dictionary with session status information
+        """
+        try:
+            session_data = await self._get_session_data(user_id)
+            context = await self.get_context(user_id)
+            
+            return {
+                "active": len(session_data) > 0,
+                "session_count": len(session_data),
+                "context_loaded": len(context.recent_messages) > 0,
+                "buffer_size": len(context.recent_messages),
+                "has_summary": context.summary is not None
+            }
+        except Exception as e:
+            logger.error(f"Failed to get session data for {user_id}: {str(e)}")
+            return {
+                "active": False,
+                "session_count": 0,
+                "context_loaded": False,
+                "buffer_size": 0,
+                "has_summary": False
+            }

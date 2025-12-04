@@ -785,6 +785,47 @@ class ProceduralMemoryStore:
             logger.error(f"Failed to get procedural memory stats: {str(e)}")
             return ProceduralMemoryStats(user_id=user_id)
     
+    async def get_user_rules(self, user_id: str) -> list[dict]:
+        """Get procedural rules and instructions for a user.
+        
+        Args:
+            user_id: User identifier
+            
+        Returns:
+            List of rule dictionaries
+        """
+        if not self.postgres:
+            raise ProceduralMemoryError("Store not connected")
+        
+        try:
+            # Get instructions which are the procedural rules
+            instructions = await self.get_all_instructions(user_id)
+            
+            rules = []
+            for instruction in instructions:
+                rules.append({
+                    "title": instruction.title,
+                    "instruction": instruction.instruction,
+                    "priority": instruction.priority
+                })
+            
+            # Also add profile-based preferences
+            profile = await self.get_user_profile(user_id)
+            if profile.entries:
+                for entry_key, entry in profile.entries.items():
+                    # entry_key format is "category.key", value is ProfileEntry object
+                    category_key = entry_key.replace(".", ": ")
+                    rules.append({
+                        "title": f"User Preference: {category_key}",
+                        "instruction": f"Remember that user prefers: {entry.value}"
+                    })
+            
+            return rules
+            
+        except Exception as e:
+            logger.error(f"Failed to get user rules for {user_id}: {str(e)}")
+            return []
+    
     async def delete_all_user_data(self, user_id: str) -> tuple[int, int]:
         """Delete all procedural memory data for a user.
         

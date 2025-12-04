@@ -15,7 +15,8 @@ from src.core.config import settings
 from src.core.domain.events import GovernorEvent, MessageType, ChannelType
 from src.core.domain.state import GovernorState, StateNode
 from src.core.workflow.governor_workflow import GovernorWorkflow
-from src.memory.tiers.semantic import SemanticMemoryStore
+from src.memory import MemoryManager, get_memory_manager
+from src.memory.context.enhanced_assembler import EnhancedContextAssembler
 import openai
 import os
 # Web interface removed - using separate React frontend
@@ -43,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 # Initialize Governor workflow
 governor_workflow = GovernorWorkflow()
+
+# Global memory manager and enhanced context assembler
+memory_manager: Optional[MemoryManager] = None
+enhanced_context_assembler: Optional[EnhancedContextAssembler] = None
 
 # In-memory session storage (in production, this would be Redis/database)
 chat_sessions: Dict[str, GovernorState] = {}
@@ -74,14 +79,18 @@ async def process_governor_workflow(
     try:
         logger.debug(f"🔄 [REQ-{request_id}] Initializing workflow components...")
         
-        # Initialize context assembler with logging
-        from src.governor.context.assembler import ContextAssembler
+        # Initialize tool registry and get global context assembler
         from src.action_plane.tool_registry.registry import ToolRegistry
         
-        context_assembler = ContextAssembler()
         tool_registry = ToolRegistry()
         
-        logger.debug(f"⚙️  [REQ-{request_id}] Context assembler and tool registry initialized")
+        # Use global enhanced context assembler
+        global enhanced_context_assembler
+        if enhanced_context_assembler is None:
+            logger.error(f"❌ [REQ-{request_id}] Enhanced context assembler not initialized")
+            raise RuntimeError("Memory system not properly initialized")
+        
+        logger.debug(f"⚙️  [REQ-{request_id}] Using enhanced context assembler with memory integration")
         
         # Step 1: Update state with new input
         existing_state.total_turns += 1
@@ -94,21 +103,21 @@ async def process_governor_workflow(
         available_tools = tool_registry.list_tools()
         logger.info(f"🛠️  [REQ-{request_id}] Found {len(available_tools)} available tools")
         
-        # Step 3: Assemble context from all memory tiers
+        # Step 3: Assemble context from all memory tiers using enhanced assembler
         logger.info(f"🧠 [REQ-{request_id}] Assembling context from RAG++ memory hierarchy...")
         try:
-            context_data = await context_assembler.assemble_context(
+            context_prompt = await enhanced_context_assembler.assemble_context(
                 user_id=event.user_id,
                 current_input=event.content,
                 state=existing_state,
                 available_tools=list(available_tools)
             )
-            logger.info(f"✅ [REQ-{request_id}] Context assembled successfully")
-            logger.debug(f"📊 [REQ-{request_id}] Context metadata: {context_data.metadata}")
-            memory_tiers_accessed = 4  # All tiers accessed
+            logger.info(f"✅ [REQ-{request_id}] Enhanced context assembled successfully")
+            logger.debug(f"📊 [REQ-{request_id}] Context length: {len(context_prompt)} characters")
+            memory_tiers_accessed = 4  # All tiers accessed via memory manager
         except Exception as e:
-            logger.warning(f"⚠️  [REQ-{request_id}] Context assembly failed, using fallback: {e}")
-            context_data = None
+            logger.warning(f"⚠️  [REQ-{request_id}] Enhanced context assembly failed, using fallback: {e}")
+            context_prompt = _build_fallback_context_prompt(event, existing_state, available_tools)
             memory_tiers_accessed = 0
         
         # Step 4: Process through workflow nodes (simplified for production stability)
@@ -127,12 +136,12 @@ async def process_governor_workflow(
             logger.debug(f"🎯 [REQ-{request_id}] Workflow step: {step_name} - {step_description}")
             existing_state.current_node = StateNode(step_name) if step_name != "respond" else StateNode.IDLE
         
-        # Step 5: Generate intelligent response
+        # Step 5: Generate intelligent response using memory-aware context
         logger.info(f"💭 [REQ-{request_id}] Generating Governor response...")
         response_content = await generate_production_response(
             event=event,
             state=existing_state,
-            context_data=context_data,
+            context_prompt=context_prompt,
             available_tools=available_tools,
             request_id=request_id
         )
@@ -140,11 +149,12 @@ async def process_governor_workflow(
         existing_state.last_assistant_response = response_content
         existing_state.current_node = StateNode.IDLE  # Return to idle state
         
-        # Step 6: Extract and store semantic entities (Neo4j - Tier 3 Memory)
-        await extract_and_store_semantic_memory(
+        # Step 6: Store interaction in all memory tiers via memory manager
+        await store_interaction_in_memory(
             user_id=event.user_id,
             user_message=event.content,
             assistant_response=response_content,
+            session_id=existing_state.session_id,
             request_id=request_id
         )
         
@@ -178,10 +188,85 @@ async def process_governor_workflow(
             "tools_available": 0
         }
 
+
+def _build_fallback_context_prompt(event: GovernorEvent, state: GovernorState, available_tools: list) -> str:
+    """Build fallback context prompt when enhanced context assembly fails."""
+    
+    now = datetime.utcnow()
+    tools_list = ', '.join(available_tools) if available_tools else 'None'
+    
+    return f"""You are the Headless Governor, a personal AI assistant that operates as an invisible OS layer.
+
+CORE PRINCIPLES:
+- You execute tasks autonomously when safe, ask for confirmation when risky
+- You maintain context across conversations and remember user preferences  
+- You prioritize security and never execute dangerous operations without explicit approval
+- You are helpful, efficient, and proactive in task completion
+- You explain your reasoning when making decisions
+
+CURRENT ENVIRONMENT:
+- Time: {now.strftime("%Y-%m-%d %H:%M:%S UTC")}
+- Session: {state.session_id}
+- System Status: Limited context mode (memory system unavailable)
+
+AVAILABLE TOOLS:
+- {tools_list}
+
+CURRENT SITUATION:
+- User: {event.user_id}
+- Input: {event.content}
+- Conversation Turn: #{state.total_turns}
+- Status: Operating in fallback mode with limited memory access"""
+
+
+async def store_interaction_in_memory(
+    user_id: str,
+    user_message: str,
+    assistant_response: str,
+    session_id: str,
+    request_id: str
+) -> None:
+    """Store interaction in all memory tiers via memory manager."""
+    global memory_manager
+    
+    if memory_manager is None:
+        logger.warning(f"⚠️  [REQ-{request_id}] Memory manager not initialized, skipping memory storage")
+        return
+    
+    try:
+        logger.debug(f"💾 [REQ-{request_id}] Storing interaction in RAG++ memory hierarchy...")
+        
+        interaction_data = {
+            "content": user_message,
+            "assistant_response": assistant_response,
+            "session_id": session_id,
+            "metadata": {
+                "request_id": request_id,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        }
+        
+        storage_result = await memory_manager.store_interaction(user_id, interaction_data)
+        
+        # Log storage results
+        if storage_result.get("status") == "stored":
+            stored_tiers = [
+                tier for tier, status in storage_result.items()
+                if tier.endswith("_status") and status == "success"
+            ]
+            logger.info(f"✅ [REQ-{request_id}] Interaction stored in {len(stored_tiers)} memory tiers")
+        else:
+            logger.warning(f"⚠️  [REQ-{request_id}] Partial memory storage: {storage_result.get('status')}")
+            
+    except Exception as e:
+        logger.error(f"❌ [REQ-{request_id}] Failed to store interaction in memory: {e}")
+        # Continue execution even if memory storage fails
+
+
 async def generate_production_response(
     event: GovernorEvent,
     state: GovernorState,
-    context_data: Any,
+    context_prompt: str,
     available_tools: list,
     request_id: str
 ) -> str:
@@ -189,13 +274,8 @@ async def generate_production_response(
     logger.debug(f"🎨 [REQ-{request_id}] Generating response via OpenAI LLM...")
     
     try:
-        # Build comprehensive system prompt with context
-        system_prompt = build_governor_system_prompt(
-            state=state,
-            context_data=context_data,
-            available_tools=available_tools,
-            request_id=request_id
-        )
+        # Use the memory-aware context prompt directly as system prompt
+        system_prompt = context_prompt
         
         # Build conversation history for context
         messages = [
@@ -255,107 +335,13 @@ async def generate_production_response(
         
         # Fallback to rule-based response
         logger.warning(f"⚠️  [REQ-{request_id}] Using fallback response generation")
-        return generate_fallback_response(event, state, context_data, available_tools, request_id)
+        return generate_fallback_response(event, state, available_tools, request_id)
 
-def build_governor_system_prompt(
-    state: GovernorState,
-    context_data: Any,
-    available_tools: list,
-    request_id: str
-) -> str:
-    """Build comprehensive system prompt for the Governor LLM."""
-    
-    # Core identity and capabilities
-    core_identity = """You are the Headless Governor, a sophisticated Personal AI Assistant operating as an invisible OS layer. You have access to a complete RAG++ memory hierarchy and can execute tasks autonomously with proper safety checks.
 
-CORE PRINCIPLES:
-- You are proactive, intelligent, and context-aware across all conversations
-- You maintain persistent memory and learn user preferences over time  
-- You execute tasks autonomously when safe, ask for confirmation when risky
-- You prioritize security and never execute dangerous operations without approval
-- You explain your reasoning and provide transparent system information
-
-ARCHITECTURE:
-- 4-Tier Memory: Short-term (Redis), Episodic (PostgreSQL), Semantic (Neo4j), Procedural (Rules)
-- 7-Node Workflow: Idle → Analyze → Tool Decision → Policy Check → Execute → Await Confirmation → Respond
-- Tool Registry: Functions for task execution with risk assessment
-- Policy Engine: Security evaluation and permission management"""
-
-    # Current session context
-    session_context = f"""
-CURRENT SESSION:
-- User ID: {state.user_id}
-- Session: {state.session_id}
-- Turn: #{state.total_turns}
-- State: {state.current_node.value}
-- Request ID: {request_id}"""
-
-    # Memory and context information
-    memory_info = """
-MEMORY CONTEXT:"""
-    
-    if context_data:
-        memory_info += f"""
-- Context assembled from all 4 memory tiers
-- Profile and preferences available
-- Conversation history accessible
-- Behavioral instructions loaded"""
-    else:
-        memory_info += """
-- Limited memory context (fallback mode)
-- Basic session information available"""
-
-    # Available capabilities
-    capabilities_info = f"""
-AVAILABLE CAPABILITIES:
-- Tool Functions: {len(available_tools)} registered
-- Autonomous Execution: Policy-checked
-- Memory Integration: RAG++ hierarchy
-- Session Persistence: Cross-conversation continuity"""
-
-    # Response guidelines
-    response_guidelines = """
-RESPONSE GUIDELINES:
-- Be conversational, helpful, and contextually aware
-- Reference previous interactions when relevant
-- Explain your capabilities and reasoning clearly
-- Provide system transparency when requested
-- Ask for clarification when user intent is ambiguous
-- Offer proactive suggestions based on context"""
-
-    return f"{core_identity}\n{session_context}\n{memory_info}\n{capabilities_info}\n{response_guidelines}"
-
-async def extract_and_store_semantic_memory(
-    user_id: str,
-    user_message: str,
-    assistant_response: str,
-    request_id: str
-) -> None:
-    """Extract and store semantic entities from conversation in Neo4j."""
-    try:
-        logger.debug(f"🧠 [REQ-{request_id}] Extracting semantic entities for Neo4j storage...")
-        
-        async with SemanticMemoryStore() as semantic_store:
-            extraction_result = await semantic_store.extract_and_store_entities(
-                user_id=user_id,
-                user_message=user_message,
-                assistant_response=assistant_response
-            )
-            
-            logger.info(
-                f"✅ [REQ-{request_id}] Stored {len(extraction_result.entities)} entities "
-                f"and {len(extraction_result.relationships)} relationships in Neo4j"
-            )
-            
-    except Exception as e:
-        logger.warning(f"⚠️  [REQ-{request_id}] Semantic memory extraction failed: {e}")
-        # Don't fail the entire workflow if semantic memory fails
-        pass
 
 def generate_fallback_response(
     event: GovernorEvent,
     state: GovernorState,
-    context_data: Any,
     available_tools: list,
     request_id: str
 ) -> str:
@@ -365,7 +351,7 @@ def generate_fallback_response(
 
 **Current Status:**
 - Session: Turn #{state.total_turns} 
-- Memory: {'✅ Context Available' if context_data else '⚠️ Limited Context'}
+- Memory: ⚠️ Limited Context (LLM connection unavailable)
 - Tools: {len(available_tools)} functions ready
 - Request: `{request_id}`
 
@@ -401,8 +387,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Governor workflow already initialized globally
         logger.info("   ✅ LangGraph workflow loaded successfully")
         
-        logger.debug("   • Preparing memory hierarchy...")
-        logger.info("   ✅ RAG++ memory tiers configured")
+        logger.debug("   • Initializing RAG++ Memory Manager...")
+        global memory_manager, enhanced_context_assembler
+        
+        # Initialize memory manager
+        memory_manager = await get_memory_manager()
+        logger.info("   ✅ RAG++ Memory Manager initialized with 4-tier hierarchy")
+        
+        # Initialize enhanced context assembler
+        enhanced_context_assembler = EnhancedContextAssembler(memory_manager)
+        logger.info("   ✅ Enhanced Context Assembler initialized")
         
         logger.debug("   • Setting up session management...")
         logger.info("   ✅ Session storage initialized")
@@ -608,6 +602,248 @@ async def config_info() -> dict[str, str]:
         "neo4j_url": settings.neo4j_url,
         "log_level": settings.log_level,
     }
+
+
+# Memory Dashboard API Endpoints
+@app.get("/api/memory/semantic/{user_id}")
+async def get_semantic_memory(user_id: str):
+    """Get semantic memory (Neo4j) entities and relationships for a user."""
+    global memory_manager
+    
+    if memory_manager is None:
+        logger.error("Memory manager not initialized")
+        return {"entities": [], "relationships": [], "total_entities": 0, "total_relationships": 0}
+    
+    try:
+        # Use memory manager's semantic tier with proper async context
+        async with memory_manager.semantic as semantic_store:
+            entities = await semantic_store.get_entities_for_user(user_id)
+            relationships = await semantic_store.get_relationships_for_user(user_id)
+        
+        # Format entities properly
+        formatted_entities = []
+        for entity in entities:
+            formatted_entities.append({
+                "type": entity.get("type", "Unknown"),
+                "name": entity.get("name", "Unknown"),
+                "entity_id": entity.get("entity_id", entity.get("name", "Unknown"))
+            })
+        
+        # Format relationships properly
+        formatted_relationships = []
+        for rel in relationships:
+            formatted_relationships.append({
+                "from_entity": rel.get("from_entity", "Unknown"),
+                "to_entity": rel.get("to_entity", "Unknown"), 
+                "relationship_type": rel.get("relationship_type", "RELATED_TO"),
+                "weight": rel.get("weight", 0.5)
+            })
+        
+        logger.info(f"Returning {len(formatted_entities)} entities and {len(formatted_relationships)} relationships for user {user_id}")
+        
+        return {
+            "entities": formatted_entities,
+            "relationships": formatted_relationships,
+            "total_entities": len(entities),
+            "total_relationships": len(relationships)
+        }
+    except Exception as e:
+        logger.error(f"Error fetching semantic memory for {user_id}: {e}")
+        return {"entities": [], "relationships": [], "total_entities": 0, "total_relationships": 0}
+
+
+@app.get("/api/memory/episodic/{user_id}")
+async def get_episodic_memory(user_id: str):
+    """Get episodic memory (PostgreSQL) conversations for a user."""
+    global memory_manager
+    
+    if memory_manager is None:
+        logger.error("Memory manager not initialized")
+        return {"episodes": []}
+    
+    try:
+        # Use memory manager's episodic tier with proper async context
+        async with memory_manager.episodic as episodic_store:
+            episodes = await episodic_store.get_recent_episodes(user_id, limit=10)
+        
+        formatted_episodes = []
+        for episode in episodes:
+            formatted_episodes.append({
+                "content": episode["content"][:200],  # Truncate for display
+                "timestamp": episode["timestamp"],
+                "sender": episode["metadata"].get("sender", "user")
+            })
+        
+        return {"episodes": formatted_episodes}
+    except Exception as e:
+        logger.error(f"Error fetching episodic memory for {user_id}: {e}")
+        return {"episodes": []}
+
+
+@app.get("/api/memory/procedural/{user_id}")
+async def get_procedural_memory(user_id: str):
+    """Get procedural memory (PostgreSQL) rules and preferences for a user."""
+    global memory_manager
+    
+    if memory_manager is None:
+        logger.error("Memory manager not initialized")
+        return {"rules": []}
+    
+    try:
+        # Use memory manager's procedural tier for consistency
+        rules = await memory_manager.procedural.get_user_rules(user_id)
+        
+        formatted_rules = []
+        for rule in rules:
+            formatted_rules.append({
+                "title": rule.get("title", "User Preference"),
+                "instruction": rule.get("instruction", rule.get("content", ""))
+            })
+        
+        return {"rules": formatted_rules}
+    except Exception as e:
+        logger.error(f"Error fetching procedural memory for {user_id}: {e}")
+        return {"rules": []}
+
+
+@app.get("/api/memory/stats/{user_id}")
+async def get_memory_stats(user_id: str):
+    """Get memory statistics for a user across all tiers."""
+    global memory_manager
+    
+    if memory_manager is None:
+        logger.error("Memory manager not initialized")
+        return {"entity_count": 0, "relationship_count": 0, "user_id": user_id}
+    
+    try:
+        # Get counts from semantic memory via memory manager
+        entities = await memory_manager.semantic.get_entities_for_user(user_id)
+        relationships = await memory_manager.semantic.get_relationships_for_user(user_id)
+        
+        return {
+            "entity_count": len(entities),
+            "relationship_count": len(relationships),
+            "user_id": user_id
+        }
+    except Exception as e:
+        logger.error(f"Error fetching memory stats for {user_id}: {e}")
+        return {"entity_count": 0, "relationship_count": 0, "user_id": user_id}
+
+
+@app.get("/api/memory/redis/{user_id}")
+async def get_redis_memory(user_id: str):
+    """Get short-term memory (Redis) data for a user."""
+    global memory_manager
+    
+    if memory_manager is None:
+        logger.error("Memory manager not initialized")
+        return {"active": False, "session_count": 0, "context_loaded": False}
+    
+    try:
+        # Use memory manager's short-term tier for consistency
+        session_data = await memory_manager.short_term.get_session_data(user_id)
+        return session_data
+    except Exception as e:
+        logger.error(f"Error fetching Redis memory for {user_id}: {e}")
+        return {"active": False, "session_count": 0, "context_loaded": False}
+
+
+@app.delete("/api/memory/user/{user_id}")
+async def delete_user_memory(user_id: str):
+    """Delete all memory data for a user across all tiers."""
+    global memory_manager
+    
+    if memory_manager is None:
+        logger.error("Memory manager not initialized")
+        return {"success": False, "error": "Memory manager not available"}
+    
+    try:
+        logger.info(f"🗑️ Starting complete memory deletion for user {user_id}")
+        
+        deletion_results = {}
+        total_deleted = 0
+        
+        # Delete from Tier 1: Redis (Short-term memory)
+        try:
+            async with memory_manager.short_term as short_term_store:
+                await short_term_store.clear_session(user_id)
+            deletion_results["tier1_redis"] = {"status": "success", "deleted": "session_data"}
+            logger.info(f"✅ Tier 1 (Redis) data cleared for user {user_id}")
+        except Exception as e:
+            deletion_results["tier1_redis"] = {"status": "error", "error": str(e)}
+            logger.error(f"❌ Failed to clear Tier 1 data for {user_id}: {e}")
+        
+        # Delete from Tier 2: PostgreSQL (Episodic memory)
+        try:
+            async with memory_manager.episodic as episodic_store:
+                deleted_episodes = await episodic_store.delete_user_data(user_id)
+            deletion_results["tier2_episodic"] = {"status": "success", "deleted": deleted_episodes}
+            total_deleted += deleted_episodes
+            logger.info(f"✅ Tier 2 (Episodic) deleted {deleted_episodes} episodes for user {user_id}")
+        except Exception as e:
+            deletion_results["tier2_episodic"] = {"status": "error", "error": str(e)}
+            logger.error(f"❌ Failed to clear Tier 2 data for {user_id}: {e}")
+        
+        # Delete from Tier 3: Neo4j (Semantic memory)
+        try:
+            async with memory_manager.semantic as semantic_store:
+                deleted_graph_items = await semantic_store.delete_user_graph(user_id)
+            deletion_results["tier3_semantic"] = {"status": "success", "deleted": deleted_graph_items}
+            total_deleted += deleted_graph_items
+            logger.info(f"✅ Tier 3 (Semantic) deleted {deleted_graph_items} graph items for user {user_id}")
+        except Exception as e:
+            deletion_results["tier3_semantic"] = {"status": "error", "error": str(e)}
+            logger.error(f"❌ Failed to clear Tier 3 data for {user_id}: {e}")
+        
+        # Delete from Tier 4: PostgreSQL (Procedural memory)
+        try:
+            async with memory_manager.procedural as procedural_store:
+                deleted_profiles, deleted_instructions = await procedural_store.delete_all_user_data(user_id)
+            total_deleted_procedural = deleted_profiles + deleted_instructions
+            deletion_results["tier4_procedural"] = {"status": "success", "deleted": total_deleted_procedural}
+            total_deleted += total_deleted_procedural
+            logger.info(f"✅ Tier 4 (Procedural) deleted {total_deleted_procedural} items for user {user_id}")
+        except Exception as e:
+            deletion_results["tier4_procedural"] = {"status": "error", "error": str(e)}
+            logger.error(f"❌ Failed to clear Tier 4 data for {user_id}: {e}")
+        
+        # Clear any active chat sessions
+        try:
+            sessions_cleared = 0
+            keys_to_remove = [key for key in chat_sessions.keys() if key.startswith(f"{user_id}:")]
+            for key in keys_to_remove:
+                del chat_sessions[key]
+                sessions_cleared += 1
+            deletion_results["active_sessions"] = {"status": "success", "deleted": sessions_cleared}
+            logger.info(f"✅ Cleared {sessions_cleared} active sessions for user {user_id}")
+        except Exception as e:
+            deletion_results["active_sessions"] = {"status": "error", "error": str(e)}
+            logger.error(f"❌ Failed to clear active sessions for {user_id}: {e}")
+        
+        # Determine overall success
+        successful_tiers = sum(1 for result in deletion_results.values() if result.get("status") == "success")
+        total_tiers = len(deletion_results)
+        
+        logger.info(f"🎯 Memory deletion completed for user {user_id}: {successful_tiers}/{total_tiers} tiers successful, {total_deleted} total items deleted")
+        
+        return {
+            "success": successful_tiers > 0,
+            "user_id": user_id,
+            "total_deleted": total_deleted,
+            "tiers_cleared": successful_tiers,
+            "total_tiers": total_tiers,
+            "details": deletion_results,
+            "message": f"Successfully cleared {successful_tiers}/{total_tiers} memory tiers"
+        }
+        
+    except Exception as e:
+        logger.error(f"💥 Critical error during memory deletion for {user_id}: {e}")
+        return {
+            "success": False,
+            "user_id": user_id,
+            "error": str(e),
+            "message": "Failed to delete user memory data"
+        }
 
 
 if __name__ == "__main__":

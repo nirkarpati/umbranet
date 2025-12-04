@@ -133,7 +133,7 @@ class EpisodicMemoryStore:
                 user_id,
                 timestamp,
                 content,
-                embedding,
+                str(embedding),  # Convert list to string representation for pgvector
                 json.dumps(metadata or {})
             )
             
@@ -193,7 +193,7 @@ class EpisodicMemoryStore:
             results = await self.postgres.execute_query(
                 query,
                 user_id,
-                query_embedding,
+                str(query_embedding),  # Convert list to string for pgvector
                 similarity_threshold,
                 limit,
                 fetch=True
@@ -296,6 +296,44 @@ class EpisodicMemoryStore:
         except Exception as e:
             logger.error(f"Failed to get interaction count for user {user_id}: {str(e)}")
             return 0
+    
+    async def get_recent_episodes(self, user_id: str, limit: int = 10) -> list[dict]:
+        """Get recent episodes for a user.
+        
+        Args:
+            user_id: User identifier
+            limit: Maximum number of episodes to return
+            
+        Returns:
+            List of episode dictionaries
+        """
+        if not self.postgres:
+            raise EpisodicMemoryError("Store not connected - use async context manager")
+        
+        try:
+            query = """
+            SELECT content, timestamp, metadata
+            FROM episodic_logs 
+            WHERE user_id = $1
+            ORDER BY timestamp DESC
+            LIMIT $2
+            """
+            
+            rows = await self.postgres.execute_query(query, user_id, limit, fetch=True)
+            episodes = []
+            
+            for row in rows or []:  # Add null safety like get_recent_interactions
+                episodes.append({
+                    "content": row['content'],  # Use dictionary access like working method
+                    "timestamp": row['timestamp'].isoformat() if row['timestamp'] else "",
+                    "metadata": json.loads(row['metadata']) if row['metadata'] else {}  # Parse JSON metadata
+                })
+            
+            return episodes
+            
+        except Exception as e:
+            logger.error(f"Failed to get recent episodes for user {user_id}: {str(e)}")
+            return []
     
     async def delete_user_data(self, user_id: str) -> int:
         """Delete all episodic data for a user.
