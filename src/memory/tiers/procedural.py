@@ -384,15 +384,13 @@ class ProceduralMemoryStore:
         try:
             instruction_id = str(uuid.uuid4())
             
-            # Generate embedding for the instruction
-            async with self.embedding_provider as provider:
-                embedding = await provider.embed_text(instruction)
+            # No embedding needed for procedural rules - they're simple text rules
             
             query = """
             INSERT INTO agent_instructions 
             (user_id, instruction_id, category, title, instruction, confidence, 
-             priority, embedding, examples, exceptions, metadata)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             priority, examples, exceptions, metadata)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING instruction_id
             """
             
@@ -405,7 +403,6 @@ class ProceduralMemoryStore:
                 instruction,
                 confidence,
                 priority,
-                embedding,
                 json.dumps(examples or []),
                 json.dumps(exceptions or []),
                 json.dumps(metadata or {}),

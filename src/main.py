@@ -688,8 +688,9 @@ async def get_procedural_memory(user_id: str):
         return {"rules": []}
     
     try:
-        # Use memory manager's procedural tier for consistency
-        rules = await memory_manager.procedural.get_user_rules(user_id)
+        # Use procedural store with async context manager for proper connection
+        async with memory_manager.procedural:
+            rules = await memory_manager.procedural.get_user_rules(user_id)
         
         formatted_rules = []
         for rule in rules:
@@ -744,6 +745,25 @@ async def get_redis_memory(user_id: str):
     except Exception as e:
         logger.error(f"Error fetching Redis memory for {user_id}: {e}")
         return {"active": False, "session_count": 0, "context_loaded": False}
+
+
+@app.delete("/api/memory/redis/{user_id}")
+async def delete_redis_memory(user_id: str):
+    """Delete short-term memory (Redis) data for a user."""
+    global memory_manager
+    
+    if memory_manager is None:
+        logger.error("Memory manager not initialized")
+        return {"success": False, "message": "Memory manager not initialized"}
+    
+    try:
+        # Clear short-term memory for the user
+        await memory_manager.short_term.clear_session(user_id)
+        logger.info(f"✅ Cleared short-term memory for user {user_id}")
+        return {"success": True, "message": f"Short-term memory cleared for user {user_id}"}
+    except Exception as e:
+        logger.error(f"❌ Error clearing Redis memory for {user_id}: {e}")
+        return {"success": False, "message": f"Failed to clear short-term memory: {str(e)}"}
 
 
 @app.delete("/api/memory/user/{user_id}")

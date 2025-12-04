@@ -830,6 +830,31 @@
   transform: none;
 }
 
+/* Delete tier button */
+.delete-tier-btn {
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 6px;
+  padding: 4px 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.delete-tier-btn:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.2);
+  transform: translateY(-1px);
+}
+
+.delete-tier-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
 /* Color coding for tiers */
 .tier-1 { border-left: 4px solid #87ceeb; }
 .tier-2 { border-left: 4px solid #74b9ff; }
