@@ -14,12 +14,11 @@ from typing import Any
 from ...core.domain.semantic import (
     EntityExtractionResult,
     EntityType,
-    GraphEntity,
-    GraphRelationship,
     GraphStats,
     RelationshipType,
-    SemanticFact,
 )
+from ...core.embeddings.base import EmbeddingProvider
+from ...core.embeddings.provider_factory import get_embedding_provider
 from ..database.neo4j_client import Neo4jConnection, get_neo4j_connection
 from ..services.entity_extractor import EntityExtractor
 
@@ -34,10 +33,15 @@ class SemanticMemoryError(Exception):
 class SemanticMemoryStore:
     """Neo4j-based semantic memory store with weighted probabilistic relationships."""
     
-    def __init__(self):
-        """Initialize semantic memory store."""
+    def __init__(self, embedding_provider: EmbeddingProvider | None = None):
+        """Initialize semantic memory store.
+        
+        Args:
+            embedding_provider: Optional embedding provider for vector search
+        """
         self.neo4j: Neo4jConnection | None = None
-        self.entity_extractor = EntityExtractor()
+        self.embedding_provider = embedding_provider or get_embedding_provider()
+        self.entity_extractor = EntityExtractor(self.embedding_provider)
     
     async def __aenter__(self) -> "SemanticMemoryStore":
         """Async context manager entry."""
@@ -230,7 +234,7 @@ class SemanticMemoryStore:
                 )
             
             # Ensure user entity exists
-            user_entity_id = await self.upsert_entity(
+            await self.upsert_entity(
                 user_id=user_id,
                 entity_type=EntityType.USER,
                 entity_name="User",
@@ -269,120 +273,281 @@ class SemanticMemoryStore:
             logger.error(f"Failed to extract and store entities: {str(e)}")
             raise SemanticMemoryError(f"Entity extraction failed: {str(e)}") from e
     
-    async def get_related_facts(
+    async def _vector_search_entities(
         self,
+        query_embedding: list[float],
         user_id: str,
-        query_text: str,
-        max_depth: int = 2,
-        min_weight: float = 0.3,
-        limit: int = 10
-    ) -> list[SemanticFact]:
-        """Get semantic facts related to query text via graph traversal.
+        limit: int = 5,
+        similarity_threshold: float = 0.7
+    ) -> list[dict[str, Any]]:
+        """Search for similar entities using vector similarity.
         
         Args:
-            user_id: User identifier
-            query_text: Text to find related facts for
-            max_depth: Maximum graph traversal depth
-            min_weight: Minimum relationship weight
-            limit: Maximum facts to return
+            query_embedding: Query embedding vector
+            user_id: User identifier for tenant isolation
+            limit: Number of similar entities to return
+            similarity_threshold: Minimum similarity score
             
         Returns:
-            List of semantic facts
+            List of similar entities with similarity scores
         """
         if not self.neo4j:
             raise SemanticMemoryError("Store not connected")
         
         try:
-            # Extract key terms from query for entity matching
-            query_terms = [
-                term.strip().lower() 
-                for term in query_text.split() 
-                if len(term.strip()) > 2
-            ]
+            results = await self.neo4j.query_vector_index(
+                query_embedding=query_embedding,
+                k=limit,
+                user_id=user_id,
+                similarity_threshold=similarity_threshold
+            )
             
-            # Build fuzzy entity matching query
-            entity_matches = []
-            for term in query_terms[:5]:  # Limit to avoid overly complex queries
-                entity_matches.append(f"toLower(e.name) CONTAINS '{term}'")
+            logger.debug(f"Found {len(results)} similar entities via vector search")
+            return results
             
-            if not entity_matches:
-                return []
+        except Exception as e:
+            logger.error(f"Vector search failed: {str(e)}")
+            raise SemanticMemoryError(f"Vector search failed: {str(e)}") from e
+    
+    async def recall_local(
+        self,
+        user_id: str,
+        query: str,
+        limit: int = 5,
+        similarity_threshold: float = 0.7
+    ) -> str:
+        """Perform local recall using vector search + graph traversal.
+        
+        This method:
+        1. Embeds the query
+        2. Finds top similar entities (anchors) via vector search
+        3. Performs graph traversal to get anchors + 1-hop neighbors
+        4. Formats the subgraph as text context
+        
+        Args:
+            user_id: User identifier
+            query: Query text
+            limit: Number of anchor entities to find
+            similarity_threshold: Minimum similarity for anchor selection
             
-            # Query for related facts through graph traversal
-            query = f"""
-            MATCH (e {{user_id: $user_id}})
-            WHERE {' OR '.join(entity_matches)}
-            MATCH (e)-[r*1..{max_depth}]-(related {{user_id: $user_id}})
-            WHERE ALL(rel in r WHERE rel.weight >= $min_weight)
-            WITH e, related, r[-1] as last_rel
-            WHERE e <> related
-            RETURN DISTINCT
-                e.entity_id as subject_id,
-                e.name as subject_name,
-                labels(e) as subject_labels,
-                e as subject_props,
-                type(last_rel) as relationship_type,
-                last_rel.weight as relationship_weight,
-                last_rel as relationship_props,
-                related.entity_id as object_id,
-                related.name as object_name,
-                labels(related) as object_labels,
-                related as object_props
-            ORDER BY last_rel.weight DESC
+        Returns:
+            Formatted text context of the local subgraph
+        """
+        if not self.neo4j:
+            raise SemanticMemoryError("Store not connected")
+        
+        try:
+            # Step 1: Embed the query
+            query_embedding = await self.embedding_provider.embed_text(query)
+            
+            # Step 2: Find similar anchor entities
+            anchor_results = await self._vector_search_entities(
+                query_embedding=query_embedding,
+                user_id=user_id,
+                limit=limit,
+                similarity_threshold=similarity_threshold
+            )
+            
+            if not anchor_results:
+                return "No relevant entities found in local memory."
+            
+            # Extract anchor entity IDs
+            anchor_ids = [result["entity"]["entity_id"] for result in anchor_results]
+            
+            # Step 3: Get anchors + 1-hop neighbors + relationships
+            subgraph_query = """
+            MATCH (anchor {user_id: $user_id})
+            WHERE anchor.entity_id IN $anchor_ids
+            
+            // Get anchors and their 1-hop neighbors
+            OPTIONAL MATCH (anchor)-[r]-(neighbor {user_id: $user_id})
+            WHERE r.weight >= 0.3
+            
+            // Collect all entities and relationships
+            WITH anchor, collect(DISTINCT neighbor) as neighbors, 
+                 collect(DISTINCT {rel: r, neighbor: neighbor}) as relationships
+            
+            RETURN 
+                anchor.entity_id as anchor_id,
+                anchor.name as anchor_name,
+                labels(anchor)[0] as anchor_type,
+                anchor.properties as anchor_props,
+                [
+                    n IN neighbors WHERE n IS NOT NULL | {
+                        id: n.entity_id,
+                        name: n.name,
+                        type: labels(n)[0],
+                        properties: n.properties
+                    }
+                ] as neighbor_entities,
+                [
+                    rel_data IN relationships WHERE rel_data.neighbor IS NOT NULL | {
+                        type: type(rel_data.rel),
+                        weight: rel_data.rel.weight,
+                        target_name: rel_data.neighbor.name
+                    }
+                ] as neighbor_relationships
+            """
+            
+            subgraph_results = await self.neo4j.execute_query(subgraph_query, {
+                "user_id": user_id,
+                "anchor_ids": anchor_ids
+            })
+            
+            # Step 4: Format as text context
+            context_parts = ["## Local Memory Context\n"]
+            
+            for result in subgraph_results:
+                anchor_name = result["anchor_name"]
+                anchor_type = result["anchor_type"]
+                
+                context_parts.append(f"**{anchor_name}** ({anchor_type})")
+                
+                # Add relationships
+                relationships = result["neighbor_relationships"]
+                for rel in relationships:
+                    rel_type = rel["type"].replace("_", " ").title()
+                    target = rel["target_name"]
+                    weight = rel["weight"]
+                    context_parts.append(
+                        f"  - {rel_type}: {target} (confidence: {weight:.2f})"
+                    )
+                
+                context_parts.append("")  # Empty line between entities
+            
+            if len(context_parts) <= 2:  # Only header + empty parts
+                return "No detailed relationships found in local memory."
+            
+            formatted_context = "\n".join(context_parts).strip()
+            logger.debug(f"Generated local recall context for query: {query}")
+            return formatted_context
+            
+        except Exception as e:
+            logger.error(f"Local recall failed: {str(e)}")
+            raise SemanticMemoryError(f"Local recall failed: {str(e)}") from e
+    
+    async def recall_global(
+        self,
+        user_id: str,
+        query: str,
+        limit: int = 3,
+        similarity_threshold: float = 0.6
+    ) -> str:
+        """Perform global recall using community summaries.
+        
+        This method:
+        1. Retrieves all CommunitySummary nodes for the user
+        2. If embeddings exist, filters by vector similarity to query
+        3. Returns the summary text
+        
+        Args:
+            user_id: User identifier
+            query: Query text
+            limit: Maximum number of community summaries to return
+            similarity_threshold: Minimum similarity for community selection
+            
+        Returns:
+            Formatted community summary text
+        """
+        if not self.neo4j:
+            raise SemanticMemoryError("Store not connected")
+        
+        try:
+            # For now, retrieve all CommunitySummary nodes
+            # TODO: Implement community detection and storage
+            community_query = """
+            MATCH (c:CommunitySummary {user_id: $user_id})
+            RETURN c.community_id as id,
+                   c.level as level,
+                   c.summary as summary,
+                   c.embedding as embedding
+            ORDER BY c.level, c.community_id
             LIMIT $limit
             """
             
-            results = await self.neo4j.execute_query(query, {
+            community_results = await self.neo4j.execute_query(community_query, {
                 "user_id": user_id,
-                "min_weight": min_weight,
                 "limit": limit
             })
             
-            # Convert to SemanticFact objects
-            facts = []
-            for row in results:
-                # Create subject entity
-                subject = GraphEntity(
-                    entity_id=row["subject_id"],
-                    entity_type=EntityType(row["subject_labels"][0]),
-                    name=row["subject_name"],
-                    user_id=user_id,
-                    properties=dict(row["subject_props"])
-                )
-                
-                # Create object entity
-                object_entity = GraphEntity(
-                    entity_id=row["object_id"],
-                    entity_type=EntityType(row["object_labels"][0]),
-                    name=row["object_name"],
-                    user_id=user_id,
-                    properties=dict(row["object_props"])
-                )
-                
-                # Create relationship
-                relationship = GraphRelationship(
-                    from_entity_id=row["subject_id"],
-                    to_entity_id=row["object_id"],
-                    relationship_type=RelationshipType(row["relationship_type"]),
-                    weight=float(row["relationship_weight"]),
-                    user_id=user_id,
-                    properties=dict(row["relationship_props"])
-                )
-                
-                facts.append(SemanticFact(
-                    subject=subject,
-                    relationship=relationship,
-                    object=object_entity,
-                    confidence=float(row["relationship_weight"]),
-                    context={"query_terms": query_terms}
-                ))
+            if not community_results:
+                return "No community summaries available in global memory."
             
-            logger.debug(f"Retrieved {len(facts)} semantic facts for query: {query_text}")
-            return facts
+            # If query provided and communities have embeddings, filter by similarity
+            if query and any(result.get("embedding") for result in community_results):
+                try:
+                    query_embedding = await self.embedding_provider.embed_text(query)
+                    
+                    # Calculate similarity scores for communities with embeddings
+                    scored_communities: list[tuple[float, dict[str, Any]]] = []
+                    for result in community_results:
+                        if result.get("embedding"):
+                            # Calculate cosine similarity
+                            community_embedding = result["embedding"]
+                            similarity = self._cosine_similarity(query_embedding, community_embedding)
+                            
+                            if similarity >= similarity_threshold:
+                                scored_communities.append((similarity, result))
+                    
+                    # Sort by similarity and take top results
+                    scored_communities.sort(key=lambda x: x[0], reverse=True)
+                    community_results = [result for _, result in scored_communities[:limit]]
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to filter communities by similarity: {e}")
+                    # Continue with unfiltered results
+            
+            # Format community summaries
+            context_parts = ["## Global Memory Context\n"]
+            
+            for i, result in enumerate(community_results, 1):
+                summary = result["summary"]
+                level = result.get("level", 0)
+                
+                context_parts.append(f"**Community {i}** (Level {level})")
+                context_parts.append(f"{summary}")
+                context_parts.append("")  # Empty line between communities
+            
+            if len(context_parts) <= 2:  # Only header
+                return "No community summaries found in global memory."
+            
+            formatted_context = "\n".join(context_parts).strip()
+            logger.debug(f"Generated global recall context for query: {query}")
+            return formatted_context
             
         except Exception as e:
-            logger.error(f"Failed to get related facts: {str(e)}")
-            raise SemanticMemoryError(f"Fact retrieval failed: {str(e)}") from e
+            logger.error(f"Global recall failed: {str(e)}")
+            raise SemanticMemoryError(f"Global recall failed: {str(e)}") from e
+    
+    def _cosine_similarity(self, vec1: list[float], vec2: list[float]) -> float:
+        """Calculate cosine similarity between two vectors.
+        
+        Args:
+            vec1: First vector
+            vec2: Second vector
+            
+        Returns:
+            Cosine similarity score (0.0 to 1.0)
+        """
+        if len(vec1) != len(vec2) or not vec1 or not vec2:
+            return 0.0
+        
+        # Calculate dot product
+        dot_product = sum(a * b for a, b in zip(vec1, vec2, strict=True))
+        
+        # Calculate magnitudes
+        magnitude1 = sum(a * a for a in vec1) ** 0.5
+        magnitude2 = sum(b * b for b in vec2) ** 0.5
+        
+        if magnitude1 == 0.0 or magnitude2 == 0.0:
+            return 0.0
+        
+        # Cosine similarity
+        similarity = dot_product / (magnitude1 * magnitude2)
+        
+        # Ensure result is in [0, 1] range (convert from [-1, 1])
+        return max(0.0, similarity)
+    
     
     async def get_user_graph_stats(self, user_id: str) -> GraphStats:
         """Get statistics about user's semantic graph.

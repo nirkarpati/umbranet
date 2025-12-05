@@ -2,7 +2,7 @@
 
 import logging
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Any
 
 from ...memory.tiers.semantic import SemanticMemoryStore
 from ..queue.schemas import MemoryReflectionJob
@@ -13,7 +13,7 @@ class SemanticProcessor:
     """Processor for Tier 3: Semantic Memory operations."""
     
     def __init__(self):
-        self.semantic_store: Optional[SemanticMemoryStore] = None
+        self.semantic_store: SemanticMemoryStore | None = None
         self.processing_count = 0
         self.success_count = 0
         self.error_count = 0
@@ -37,7 +37,7 @@ class SemanticProcessor:
             pass
         logger.info("🧹 Semantic processor cleaned up")
     
-    async def process_job(self, job: MemoryReflectionJob) -> Dict[str, Any]:
+    async def process_job(self, job: MemoryReflectionJob) -> dict[str, Any]:
         """Process semantic memory for reflection job with intelligent pattern detection."""
         start_time = datetime.utcnow()
         self.processing_count += 1
@@ -113,7 +113,7 @@ class SemanticProcessor:
         user_id: str, 
         user_message: str, 
         assistant_response: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Use LLM to intelligently decide what should go to semantic memory."""
         
         # Get existing context for pattern detection
@@ -283,7 +283,7 @@ Focus on permanent facts and established patterns, not temporary experiences.
             logger.warning(f"Failed to get recent episodes: {e}")
             return "Unable to retrieve recent episodic context."
     
-    async def _fallback_to_full_extraction(self, user_id: str, user_message: str, assistant_response: str) -> Dict[str, Any]:
+    async def _fallback_to_full_extraction(self, user_id: str, user_message: str, assistant_response: str) -> dict[str, Any]:
         """Fallback to original extraction method if pattern detection fails."""
         try:
             extraction_result = await self.semantic_store.extract_and_store_entities(
@@ -312,16 +312,16 @@ Focus on permanent facts and established patterns, not temporary experiences.
         entities: list[dict], 
         relationships: list[dict], 
         user_id: str
-    ) -> Dict[str, Any]:
-        """Store approved entities and relationships to knowledge graph."""
+    ) -> dict[str, Any]:
+        """Store approved entities and relationships to knowledge graph with embeddings."""
         
-        from ...core.domain.semantic import EntityType, RelationshipType, GraphEntity, GraphRelationship
+        from ...core.domain.semantic import EntityType, RelationshipType
         
         stored_entities = []
         stored_relationships = []
         
         try:
-            # Ensure user entity exists
+            # Ensure user entity exists (without embedding for User entity)
             user_entity_id = await self.semantic_store.upsert_entity(
                 user_id=user_id,
                 entity_type=EntityType.USER,
@@ -329,7 +329,7 @@ Focus on permanent facts and established patterns, not temporary experiences.
                 properties={"is_primary_user": True}
             )
             
-            # Store entities
+            # Store entities with embeddings
             for entity_data in entities:
                 entity_type_str = entity_data.get("type", "ENTITY")
                 
@@ -339,17 +339,42 @@ Focus on permanent facts and established patterns, not temporary experiences.
                 except ValueError:
                     entity_type = EntityType.ENTITY
                 
-                entity_id = await self.semantic_store.upsert_entity(
+                # Generate embedding for the entity
+                entity_name = entity_data["name"]
+                entity_properties = entity_data.get("properties", {})
+                
+                # Create text for embedding: "name: properties"
+                properties_text = ", ".join([
+                    f"{k}: {v}" for k, v in entity_properties.items()
+                    if k not in ['extraction_method', 'confidence']
+                ])
+                embedding_text = f"{entity_name}: {properties_text}" if properties_text else entity_name
+                
+                # Generate embedding using the semantic store's embedding provider
+                try:
+                    if not self.semantic_store:
+                        raise Exception("Semantic store not available")
+                    async with self.semantic_store.embedding_provider as provider:
+                        embedding = await provider.embed_text(embedding_text)
+                    logger.debug(f"Generated embedding for entity {entity_name} (dim: {len(embedding)})")
+                except Exception as e:
+                    logger.warning(f"Failed to generate embedding for entity {entity_name}: {e}")
+                    embedding = None
+                
+                # Store entity with embedding using direct Neo4j query
+                entity_id = await self._upsert_entity_with_embedding(
                     user_id=user_id,
                     entity_type=entity_type,
-                    entity_name=entity_data["name"],
-                    properties=entity_data.get("properties", {})
+                    entity_name=entity_name,
+                    properties=entity_properties,
+                    embedding=embedding
                 )
                 
                 stored_entities.append({
-                    "name": entity_data["name"],
+                    "name": entity_name,
                     "entity_type": entity_type.value,
-                    "entity_id": entity_id
+                    "entity_id": entity_id,
+                    "has_embedding": embedding is not None
                 })
             
             # Store relationships  
@@ -423,8 +448,88 @@ Focus on permanent facts and established patterns, not temporary experiences.
         except Exception as e:
             logger.error(f"Failed to store approved entities/relationships: {e}")
             raise
+    
+    async def _upsert_entity_with_embedding(
+        self,
+        user_id: str,
+        entity_type,
+        entity_name: str,
+        properties: dict[str, Any],
+        embedding: list[float] | None = None
+    ) -> str:
+        """Upsert entity with embedding using direct Neo4j query."""
+        
+        import uuid
+        from ...core.domain.semantic import EntityType
+        
+        # Generate consistent entity ID
+        key = f"{user_id}:{entity_type.value}:{entity_name.lower().strip()}"
+        entity_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
+        
+        # Prepare properties with embedding
+        all_properties = {
+            **properties,
+            "extraction_method": "semantic_processor"
+        }
+        
+        # Build the MERGE query with embedding support
+        query = f"""
+        MERGE (e:{entity_type.value} {{entity_id: $entity_id, user_id: $user_id}})
+        ON CREATE SET 
+            e.name = $name,
+            e.created_at = datetime(),
+            e.last_updated = datetime(),
+            e += $properties
+        ON MATCH SET 
+            e.name = $name,
+            e.last_updated = datetime(),
+            e += $properties
+        """
+        
+        # Add embedding parameter if available
+        parameters = {
+            "entity_id": entity_id,
+            "user_id": user_id,
+            "name": entity_name,
+            "properties": all_properties
+        }
+        
+        # Add embedding to query if available
+        if embedding:
+            query += """
+        SET e.embedding = $embedding
+            """
+            parameters["embedding"] = embedding
+        
+        query += """
+        RETURN e.entity_id as entity_id
+        """
+        
+        # Execute the query
+        try:
+            if not self.semantic_store or not self.semantic_store.neo4j:
+                raise Exception("Semantic store or Neo4j connection not available")
+            result = await self.semantic_store.neo4j.execute_write_query(query, parameters)
+            
+            if not result:
+                raise Exception("Entity upsert returned no results")
+            
+            logger.debug(f"Upserted entity {entity_id} with embedding: {embedding is not None}")
+            return entity_id
+            
+        except Exception as e:
+            logger.error(f"Failed to upsert entity {entity_name} with embedding: {e}")
+            # Fallback to standard upsert without embedding
+            if not self.semantic_store:
+                raise Exception("Semantic store not available for fallback")
+            return await self.semantic_store.upsert_entity(
+                user_id=user_id,
+                entity_type=entity_type,
+                entity_name=entity_name,
+                properties=all_properties
+            )
 
-    def get_health(self) -> Dict[str, Any]:
+    def get_health(self) -> dict[str, Any]:
         """Get processor health metrics."""
         success_rate = self.success_count / max(self.processing_count, 1)
         return {

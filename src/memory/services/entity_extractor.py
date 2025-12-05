@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 from ...core.config import settings
 from ...core.domain.semantic import (
@@ -14,6 +14,8 @@ from ...core.domain.semantic import (
     GraphRelationship,
     RelationshipType,
 )
+from ...core.embeddings.base import EmbeddingProvider
+from ...core.embeddings.provider_factory import get_embedding_provider
 from ..services.summarizer import ConversationSummarizer
 
 logger = logging.getLogger(__name__)
@@ -27,9 +29,14 @@ class EntityExtractionError(Exception):
 class EntityExtractor:
     """Service for extracting entities and relationships from conversation text."""
     
-    def __init__(self):
-        """Initialize the entity extractor."""
+    def __init__(self, embedding_provider: Optional[EmbeddingProvider] = None):
+        """Initialize the entity extractor.
+        
+        Args:
+            embedding_provider: Optional embedding provider, uses default if None
+        """
         self.summarizer = ConversationSummarizer()
+        self.embedding_provider = embedding_provider or get_embedding_provider()
     
     async def __aenter__(self) -> "EntityExtractor":
         """Async context manager entry."""
@@ -45,131 +52,32 @@ class EntityExtractor:
         key = f"{user_id}:{entity_type.value}:{name.lower().strip()}"
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
     
-    def _extract_entities_rule_based(
-        self, 
-        text: str, 
-        user_id: str
-    ) -> list[GraphEntity]:
-        """Extract entities using rule-based pattern matching.
+    async def _generate_entity_embedding(self, entity: GraphEntity) -> list[float]:
+        """Generate embedding for an entity using its name and properties.
         
-        This is a fallback when LLM extraction is not available.
+        Args:
+            entity: Entity to generate embedding for
+            
+        Returns:
+            Embedding vector
         """
-        entities = []
-        text_lower = text.lower()
+        # Create text representation: "name: properties"
+        properties_text = ", ".join([
+            f"{k}: {v}" for k, v in entity.properties.items()
+            if k not in ['extraction_method', 'confidence', 'original_type']
+        ])
         
-        # Pattern-based extraction
-        patterns = {
-            EntityType.PERSON: [
-                r'\b(?:my|his|her)\s+(?:friend|colleague|boss|manager)\s+(\w+)',
-                r'\b(\w+)(?:\s+\w+)?\s+(?:said|told|mentioned)',
-                r'\bI\s+know\s+(\w+)',
-            ],
-            EntityType.LOCATION: [
-                r'\bin\s+([A-Z][a-zA-Z\s]+)(?:\s|,|$)',
-                r'\bfrom\s+([A-Z][a-zA-Z\s]+)(?:\s|,|$)',
-                r'\bto\s+([A-Z][a-zA-Z\s]+)(?:\s|,|$)',
-                r'\b(Seattle|Portland|San Francisco|New York|London|Tokyo)\b',
-            ],
-            EntityType.ORGANIZATION: [
-                r'\b(Google|Microsoft|Apple|Amazon|Meta|Netflix|Tesla)\b',
-                r'\bat\s+([A-Z][a-zA-Z\s]+(?:Inc|Corp|LLC|Ltd))',
-                r'\bwork(?:ing)?\s+at\s+([A-Z][a-zA-Z\s]+)',
-            ],
-            EntityType.PROJECT: [
-                r'\b(?:project|initiative)\s+([a-zA-Z][a-zA-Z0-9\s]+)',
-                r'\bworking\s+on\s+([a-zA-Z][a-zA-Z0-9\s]+)',
-            ]
-        }
+        embedding_text = f"{entity.name}: {properties_text}" if properties_text else entity.name
         
-        for entity_type, pattern_list in patterns.items():
-            for pattern in pattern_list:
-                matches = re.findall(pattern, text, re.IGNORECASE)
-                for match in matches:
-                    if isinstance(match, tuple):
-                        match = match[0]
-                    
-                    name = match.strip().title()
-                    if len(name) > 2 and name not in [e.name for e in entities]:
-                        entity_id = self._generate_entity_id(user_id, name, entity_type)
-                        entities.append(GraphEntity(
-                            entity_id=entity_id,
-                            entity_type=entity_type,
-                            name=name,
-                            user_id=user_id,
-                            properties={"extraction_method": "rule_based"}
-                        ))
-        
-        return entities
+        try:
+            embedding = await self.embedding_provider.embed_text(embedding_text)
+            return embedding
+        except Exception as e:
+            logger.warning(f"Failed to generate embedding for entity {entity.name}: {e}")
+            # Return empty list if embedding generation fails
+            return []
     
-    def _extract_preferences_rule_based(
-        self, 
-        text: str, 
-        user_id: str
-    ) -> list[GraphRelationship]:
-        """Extract user preferences using rule-based matching."""
-        relationships = []
-        text_lower = text.lower()
-        
-        # Preference patterns
-        like_patterns = [
-            r'I\s+(?:love|like|enjoy|prefer)\s+([^.!?]+)',
-            r'(?:love|like|enjoy)\s+([^.!?]+)',
-            r'I\'m\s+a\s+fan\s+of\s+([^.!?]+)',
-        ]
-        
-        dislike_patterns = [
-            r'I\s+(?:hate|dislike|avoid)\s+([^.!?]+)',
-            r'(?:don\'t|do not)\s+like\s+([^.!?]+)',
-            r'I\'m\s+not\s+a\s+fan\s+of\s+([^.!?]+)',
-        ]
-        
-        # Extract likes
-        for pattern in like_patterns:
-            matches = re.findall(pattern, text_lower, re.IGNORECASE)
-            for match in matches:
-                preference_name = match.strip().title()
-                if len(preference_name) > 2:
-                    entity_id = self._generate_entity_id(
-                        user_id, preference_name, EntityType.PREFERENCE
-                    )
-                    user_entity_id = self._generate_entity_id(
-                        user_id, "User", EntityType.USER
-                    )
-                    
-                    relationships.append(GraphRelationship(
-                        from_entity_id=user_entity_id,
-                        to_entity_id=entity_id,
-                        relationship_type=RelationshipType.LIKES,
-                        weight=0.7,  # Moderate confidence for rule-based
-                        decay_rate=0.01,  # Slow decay
-                        user_id=user_id,
-                        properties={"extraction_method": "rule_based"}
-                    ))
-        
-        # Extract dislikes
-        for pattern in dislike_patterns:
-            matches = re.findall(pattern, text_lower, re.IGNORECASE)
-            for match in matches:
-                preference_name = match.strip().title()
-                if len(preference_name) > 2:
-                    entity_id = self._generate_entity_id(
-                        user_id, preference_name, EntityType.PREFERENCE
-                    )
-                    user_entity_id = self._generate_entity_id(
-                        user_id, "User", EntityType.USER
-                    )
-                    
-                    relationships.append(GraphRelationship(
-                        from_entity_id=user_entity_id,
-                        to_entity_id=entity_id,
-                        relationship_type=RelationshipType.DISLIKES,
-                        weight=0.8,  # Higher confidence for negative preferences
-                        decay_rate=0.005,  # Very slow decay for dislikes
-                        user_id=user_id,
-                        properties={"extraction_method": "rule_based"}
-                    ))
-        
-        return relationships
+    
     
     async def _get_existing_graph_context(self, user_id: str) -> str:
         """Get a sample of existing entities and relationships for context consistency."""
@@ -219,13 +127,10 @@ class EntityExtractor:
     ) -> EntityExtractionResult:
         """Extract entities using LLM with context-aware structured prompting."""
         if not settings.openai_api_key:
-            # Fall back to rule-based extraction
-            entities = self._extract_entities_rule_based(text, user_id)
-            relationships = self._extract_preferences_rule_based(text, user_id)
-            return EntityExtractionResult(
-                entities=entities,
-                relationships=relationships,
-                confidence=0.6
+            logger.error("OpenAI API key not configured - cannot perform entity extraction")
+            raise EntityExtractionError(
+                "Entity extraction requires OpenAI API key for embedding-based architecture. "
+                "Rule-based fallbacks have been removed to maintain GraphRAG quality."
             )
         
         # Get existing graph context for consistency
@@ -296,7 +201,7 @@ Focus on creating a rich, meaningful knowledge graph. Use "User" as the entity n
                     raise EntityExtractionError("Could not parse LLM response as JSON")
             
             # Convert to domain objects
-            entities = []
+            entities: list[GraphEntity] = []
             relationships = []
             
             # Process entities with flexible typing
@@ -338,13 +243,14 @@ Focus on creating a rich, meaningful knowledge graph. Use "User" as the entity n
                     "original_type": entity_type_str  # Preserve LLM's original type
                 }
                 
-                entities.append(GraphEntity(
+                entity = GraphEntity(
                     entity_id=entity_id,
                     entity_type=entity_type,
                     name=entity_data["name"],
                     user_id=user_id,
                     properties=properties
-                ))
+                )
+                entities.append(entity)
             
             # Process relationships
             user_entity_id = self._generate_entity_id(user_id, "User", EntityType.USER)
@@ -403,12 +309,13 @@ Focus on creating a rich, meaningful knowledge graph. Use "User" as the entity n
                         from_entity_id = self._generate_entity_id(
                             user_id, from_name, EntityType.ENTITY
                         )
-                        entities.append(GraphEntity(
+                        new_entity = GraphEntity(
                             entity_id=from_entity_id,
                             entity_type=EntityType.ENTITY,
                             name=from_name,
                             user_id=user_id
-                        ))
+                        )
+                        entities.append(new_entity)
                     else:
                         from_entity_id = from_entity.entity_id
                 
@@ -418,12 +325,13 @@ Focus on creating a rich, meaningful knowledge graph. Use "User" as the entity n
                     to_entity_id = self._generate_entity_id(
                         user_id, to_name, EntityType.ENTITY
                     )
-                    entities.append(GraphEntity(
+                    new_entity = GraphEntity(
                         entity_id=to_entity_id,
                         entity_type=EntityType.ENTITY,
                         name=to_name,
                         user_id=user_id
-                    ))
+                    )
+                    entities.append(new_entity)
                 else:
                     to_entity_id = to_entity.entity_id
                 
@@ -450,6 +358,10 @@ Focus on creating a rich, meaningful knowledge graph. Use "User" as the entity n
                     properties=relationship_properties
                 ))
             
+            # Generate embeddings for all entities
+            for entity in entities:
+                entity.embedding = await self._generate_entity_embedding(entity)
+            
             return EntityExtractionResult(
                 entities=entities,
                 relationships=relationships,
@@ -457,15 +369,11 @@ Focus on creating a rich, meaningful knowledge graph. Use "User" as the entity n
             )
             
         except Exception as e:
-            logger.warning(f"LLM entity extraction failed: {e}, falling back to rules")
-            # Fall back to rule-based extraction
-            entities = self._extract_entities_rule_based(text, user_id)
-            relationships = self._extract_preferences_rule_based(text, user_id)
-            return EntityExtractionResult(
-                entities=entities,
-                relationships=relationships,
-                confidence=0.6
-            )
+            logger.error(f"LLM entity extraction failed: {e}")
+            raise EntityExtractionError(
+                f"Entity extraction failed: {str(e)}. "
+                "Rule-based fallbacks have been removed to maintain GraphRAG quality."
+            ) from e
     
     async def extract_from_conversation(
         self, 
@@ -494,10 +402,18 @@ Focus on creating a rich, meaningful knowledge graph. Use "User" as the entity n
 async def extract_entities(
     user_message: str, 
     assistant_response: str, 
-    user_id: str
+    user_id: str,
+    embedding_provider: Optional[EmbeddingProvider] = None
 ) -> EntityExtractionResult:
-    """Extract entities from conversation text."""
-    async with EntityExtractor() as extractor:
+    """Extract entities from conversation text.
+    
+    Args:
+        user_message: User's message
+        assistant_response: Assistant's response
+        user_id: User identifier
+        embedding_provider: Optional embedding provider
+    """
+    async with EntityExtractor(embedding_provider=embedding_provider) as extractor:
         return await extractor.extract_from_conversation(
             user_message, assistant_response, user_id
         )

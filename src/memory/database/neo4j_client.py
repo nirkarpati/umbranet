@@ -162,7 +162,10 @@ class Neo4jConnection:
             "CREATE INDEX entity_name_index IF NOT EXISTS FOR (n:Entity) ON (n.name)",
             
             # Index on relationship weights for filtering  
-            "CREATE INDEX relationship_weight_index IF NOT EXISTS FOR ()-[r:RELATES_TO]-() ON (r.weight)"
+            "CREATE INDEX relationship_weight_index IF NOT EXISTS FOR ()-[r:RELATES_TO]-() ON (r.weight)",
+            
+            # Vector index for entity embeddings (GraphRAG support)
+            "CREATE VECTOR INDEX entity_embeddings IF NOT EXISTS FOR (n:Entity) ON (n.embedding) OPTIONS {indexConfig: {`vector.dimensions`: 1536, `vector.similarity_function`: 'cosine'}}"
         ]
         
         try:
@@ -173,6 +176,63 @@ class Neo4jConnection:
         except Exception as e:
             logger.warning(f"Schema initialization partially failed: {e}")
             # Continue anyway - some constraints might already exist
+    
+    async def query_vector_index(
+        self,
+        query_embedding: list[float],
+        k: int = 10,
+        user_id: str | None = None,
+        similarity_threshold: float = 0.7
+    ) -> list[dict[str, Any]]:
+        """Query vector index for similar entities using KNN search.
+        
+        Args:
+            query_embedding: The embedding vector to search with
+            k: Number of similar entities to return
+            user_id: Optional user filter for tenant isolation
+            similarity_threshold: Minimum similarity score (0.0-1.0)
+            
+        Returns:
+            List of similar entities with similarity scores
+        """
+        # Build the Cypher query for vector similarity search
+        cypher = """
+        CALL db.index.vector.queryNodes('entity_embeddings', $k, $query_embedding)
+        YIELD node, score
+        WHERE score >= $similarity_threshold
+        """
+        
+        # Add user filter if provided
+        if user_id:
+            cypher += " AND node.user_id = $user_id"
+        
+        cypher += """
+        RETURN node {
+            .entity_id,
+            .entity_type, 
+            .name,
+            .properties,
+            .user_id,
+            .created_at,
+            .last_updated
+        } as entity, score
+        ORDER BY score DESC
+        """
+        
+        parameters = {
+            "query_embedding": query_embedding,
+            "k": k,
+            "similarity_threshold": similarity_threshold
+        }
+        
+        if user_id:
+            parameters["user_id"] = user_id
+        
+        try:
+            return await self.execute_query(cypher, parameters)
+        except Exception as e:
+            logger.error(f"Vector search failed: {str(e)}")
+            raise Neo4jConnectionError(f"Vector search failed: {str(e)}") from e
 
 
 # Global connection instance

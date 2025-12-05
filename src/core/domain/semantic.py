@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field, validator
 
@@ -110,6 +110,10 @@ class GraphEntity(BaseModel):
         default_factory=dict,
         description="Additional properties of the entity"
     )
+    embedding: Optional[list[float]] = Field(
+        default=None,
+        description="Vector embedding for semantic similarity search"
+    )
     user_id: str = Field(..., description="User this entity belongs to")
     created_at: datetime = Field(
         default_factory=datetime.utcnow,
@@ -180,51 +184,26 @@ class EntityExtractionResult(BaseModel):
     )
 
 
-class GraphQuery(BaseModel):
-    """Query for semantic graph traversal."""
-    
-    user_id: str = Field(..., description="User to query for")
-    entity_names: list[str] = Field(
-        default_factory=list,
-        description="Entity names to search for"
-    )
-    entity_types: list[EntityType] = Field(
-        default_factory=list,
-        description="Entity types to filter by"
-    )
-    relationship_types: list[RelationshipType] = Field(
-        default_factory=list,
-        description="Relationship types to follow"
-    )
-    max_depth: int = Field(
-        default=2,
-        ge=1,
-        le=5,
-        description="Maximum traversal depth"
-    )
-    min_weight: float = Field(
-        default=0.3,
-        ge=0.0,
-        le=1.0,
-        description="Minimum relationship weight to consider"
-    )
 
-
-class SemanticFact(BaseModel):
-    """A semantic fact retrieved from the knowledge graph."""
+class GraphCommunity(BaseModel):
+    """Represents a detected community in the semantic graph."""
     
-    subject: GraphEntity = Field(..., description="Subject entity")
-    relationship: GraphRelationship = Field(..., description="Relationship")
-    object: GraphEntity = Field(..., description="Object entity")
-    confidence: float = Field(
-        ge=0.0,
-        le=1.0,
-        description="Confidence in this fact"
+    community_id: str = Field(..., description="Unique identifier for the community")
+    level: int = Field(..., description="Hierarchical level of the community")
+    summary: str = Field(..., description="Text summary of the community")
+    embedding: list[float] = Field(..., description="Vector embedding of the community summary")
+    user_id: str = Field(..., description="User this community belongs to")
+    created_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        description="When this community was detected"
     )
-    context: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Additional context about this fact"
-    )
+    
+    @validator('community_id', 'summary')
+    def validate_non_empty(cls, v: str) -> str:
+        """Ensure community_id and summary are not empty."""
+        if not v or not v.strip():
+            raise ValueError("Community ID and summary cannot be empty")
+        return v.strip()
 
 
 class GraphStats(BaseModel):
