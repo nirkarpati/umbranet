@@ -85,23 +85,9 @@ const transformToGraphData = (semanticData: any): { nodes: GraphNode[]; edges: G
   console.log('Entities found:', entities.length);
   console.log('Relationships found:', relationships.length);
   
-  // If we have entities but no relationships, create some basic connections for visualization
+  // If we have entities but no relationships, display isolated nodes
   if (entities.length > 0 && relationships.length === 0) {
-    console.log('Found entities but no relationships - creating basic connections for visualization');
-    
-    // Create simple relationships between some entities for demo
-    for (let i = 0; i < entities.length - 1; i++) {
-      if (Math.random() > 0.7) { // 30% chance of connection
-        relationships.push({
-          from_entity: entities[i].name,
-          to_entity: entities[i + 1].name,
-          relationship_type: 'RELATED_TO',
-          weight: 0.5
-        });
-      }
-    }
-    
-    console.log(`Created ${relationships.length} basic relationships for visualization`);
+    console.log('Found entities but no relationships - displaying isolated nodes');
   }
   
   if (entities.length === 0 && relationships.length === 0) {
@@ -145,7 +131,9 @@ const transformToGraphData = (semanticData: any): { nodes: GraphNode[]; edges: G
       
       // Add related entity node if it doesn't exist
       if (!nodeMap.has(relatedEntity)) {
-        const angle = Math.random() * 2 * Math.PI;
+        // Use deterministic angle based on entity name for consistent positioning
+        const hash = relatedEntity.split('').reduce((acc: number, char: string) => acc + char.charCodeAt(0), 0);
+        const angle = (hash % 360) * (Math.PI / 180);
         const x = centerX + (radius + 60) * Math.cos(angle);
         const y = centerY + (radius + 60) * Math.sin(angle);
         
@@ -183,7 +171,9 @@ const transformToGraphData = (semanticData: any): { nodes: GraphNode[]; edges: G
       // Make sure both nodes exist
       [from, to].forEach(entityName => {
         if (!nodeMap.has(entityName)) {
-          const angle = Math.random() * 2 * Math.PI;
+          // Use deterministic angle based on entity name for consistent positioning
+          const hash = entityName.split('').reduce((acc: number, char: string) => acc + char.charCodeAt(0), 0);
+          const angle = (hash % 360) * (Math.PI / 180);
           const x = centerX + radius * Math.cos(angle);
           const y = centerY + radius * Math.sin(angle);
           
