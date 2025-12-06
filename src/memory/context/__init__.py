@@ -1,5 +1,6 @@
 """Memory-aware context assembly components for the RAG++ hierarchy."""
 
-from .enhanced_assembler import EnhancedContextAssembler
+# Enhanced assembler removed - using lightweight assembler in governor/context/assembler.py
+# to prevent eager loading and improve performance
 
-__all__ = ["EnhancedContextAssembler"]
+__all__ = []

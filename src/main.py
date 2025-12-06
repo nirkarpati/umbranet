@@ -16,7 +16,6 @@ from src.core.domain.events import GovernorEvent, MessageType, ChannelType
 from src.core.domain.state import GovernorState, StateNode
 from src.core.workflow.governor_workflow import GovernorWorkflow
 from src.memory import MemoryManager, get_memory_manager
-from src.memory.context.enhanced_assembler import EnhancedContextAssembler
 import openai
 import os
 # Web interface removed - using separate React frontend
@@ -45,9 +44,8 @@ logger = logging.getLogger(__name__)
 # Initialize Governor workflow
 governor_workflow = GovernorWorkflow()
 
-# Global memory manager and enhanced context assembler
+# Global memory manager
 memory_manager: Optional[MemoryManager] = None
-enhanced_context_assembler: Optional[EnhancedContextAssembler] = None
 
 # In-memory session storage (in production, this would be Redis/database)
 chat_sessions: Dict[str, GovernorState] = {}
@@ -393,7 +391,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("   ✅ RAG++ Memory Manager initialized with 4-tier hierarchy")
         
         # Initialize enhanced context assembler
-        enhanced_context_assembler = EnhancedContextAssembler(memory_manager)
+        # Enhanced context assembler removed - using lightweight assembler in governor/context/assembler.py
         logger.info("   ✅ Enhanced Context Assembler initialized")
         
         logger.debug("   • Setting up session management...")
