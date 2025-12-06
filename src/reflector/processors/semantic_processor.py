@@ -1,127 +1,344 @@
 """Processor for Tier 3: Semantic Memory operations."""
 
+import json
 import logging
 from datetime import datetime
 from typing import Any
 
-from ...memory.tiers.semantic import SemanticMemoryStore
+import httpx
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+from ...core.config import settings
+from ...core.embeddings.provider_factory import get_embedding_provider
+from ...memory.database.neo4j_client import get_neo4j_connection
+from ...memory.tools.graph_ops import GraphMaintenanceTools
 from ..queue.schemas import MemoryReflectionJob
 
 logger = logging.getLogger(__name__)
 
 
 class SemanticProcessor:
-    """Processor for Tier 3: Semantic Memory operations."""
+    """Processor for Tier 3: Semantic Memory operations using OpenAI Tool-Use Agent."""
 
     def __init__(self):
-        self.semantic_store: SemanticMemoryStore | None = None
+        self.graph_tools: GraphMaintenanceTools | None = None
+        self.http_client = httpx.AsyncClient()
         self.processing_count = 0
         self.success_count = 0
         self.error_count = 0
+        self.model = "gpt-4o-mini"
 
     async def initialize(self) -> None:
-        """Initialize semantic memory store."""
+        """Initialize graph tools and connections."""
         try:
-            self.semantic_store = SemanticMemoryStore()
-            # Test connection
-            async with self.semantic_store:
-                pass  # Connection test
-            logger.info("✅ Semantic processor initialized")
+            # Initialize Neo4j connection and embedding provider
+            neo4j_client = await get_neo4j_connection()
+            embedding_provider = get_embedding_provider()
+            
+            # Initialize graph maintenance tools
+            self.graph_tools = GraphMaintenanceTools(
+                neo4j_client=neo4j_client,
+                embedding_provider=embedding_provider
+            )
+            
+            logger.info("✅ Semantic processor initialized with GraphMaintenanceTools")
         except Exception as e:
             logger.error(f"❌ Failed to initialize semantic processor: {e}")
             raise
+    
+    async def _execute_agent_loop(
+        self, 
+        user_id: str, 
+        user_message: str, 
+        assistant_response: str
+    ) -> dict[str, Any]:
+        """Execute OpenAI Tool-Use Agent loop for knowledge graph curation."""
+        
+        # System prompt defining the Knowledge Graph Curator persona
+        system_prompt = """
+You are the Knowledge Graph Curator. Your job is to accurately reflect the user's latest conversation into the Graph.
+
+ALWAYS search for existing entities before creating new ones to avoid duplicates.
+
+Your workflow:
+1. First, search for similar entities using search_similar_nodes to avoid duplicates
+2. Create or update entities using upsert_node (with merge_id if updating existing)
+3. Create relationships between entities using create_relationship
+4. Focus on permanent facts, not temporary events
+5. When done, provide a final status message
+
+Rules:
+- The user is ALWAYS the entity 'User' - if they reveal their name, add it as a property
+- Only store semantic knowledge (facts, preferences, relationships), not episodic events
+- Use specific relationship types (HAS_MOTHER, WORKS_AT, LIKES, etc.)
+- Search before creating to prevent duplicates
+"""
+        
+        # Initial conversation context
+        initial_message = f"""
+Analyze this conversation and update the knowledge graph accordingly:
+
+User: {user_message}
+Assistant: {assistant_response}
+
+Start by searching for any entities mentioned to check for existing knowledge.
+"""
+        
+        # Initialize message history
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": initial_message}
+        ]
+        
+        # Define available tools for the agent
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_similar_nodes",
+                    "description": "Search for similar entities in the knowledge graph",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query string"
+                            },
+                            "threshold": {
+                                "type": "number",
+                                "description": "Similarity threshold (0.0-1.0)",
+                                "default": 0.8
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "upsert_node",
+                    "description": "Create or update a node in the knowledge graph",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Node name"
+                            },
+                            "label": {
+                                "type": "string",
+                                "description": "Node label/type"
+                            },
+                            "properties": {
+                                "type": "object",
+                                "description": "Node properties as key-value pairs",
+                                "default": {}
+                            },
+                            "merge_id": {
+                                "type": "string",
+                                "description": "Optional existing node ID to update"
+                            }
+                        },
+                        "required": ["name", "label"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_relationship",
+                    "description": "Create a relationship between two nodes",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "from_name": {
+                                "type": "string",
+                                "description": "Source node name"
+                            },
+                            "to_name": {
+                                "type": "string",
+                                "description": "Target node name"
+                            },
+                            "relation_type": {
+                                "type": "string",
+                                "description": "Relationship type"
+                            },
+                            "properties": {
+                                "type": "object",
+                                "description": "Relationship properties",
+                                "default": {}
+                            }
+                        },
+                        "required": ["from_name", "to_name", "relation_type"]
+                    }
+                }
+            }
+        ]
+        
+        # Execute the tool-calling loop with safety limit
+        max_steps = 10
+        step = 0
+        
+        while step < max_steps:
+            step += 1
+            logger.info(f"🤖 Agent loop step {step}/{max_steps}")
+            
+            # Make API call to OpenAI
+            response = await self._call_openai_with_tools(messages, tools)
+            
+            # Add assistant response to message history
+            messages.append(response["choices"][0]["message"])
+            
+            # Check if assistant wants to call tools
+            assistant_message = response["choices"][0]["message"]
+            
+            if "tool_calls" in assistant_message and assistant_message["tool_calls"]:
+                logger.info(f"🔧 Agent requesting {len(assistant_message['tool_calls'])} tool calls")
+                
+                # Execute each tool call
+                for tool_call in assistant_message["tool_calls"]:
+                    function_name = tool_call["function"]["name"]
+                    arguments = json.loads(tool_call["function"]["arguments"])
+                    
+                    logger.info(f"🛠️ Executing {function_name} with args: {arguments}")
+                    
+                    # Execute the tool
+                    if function_name == "search_similar_nodes":
+                        tool_result = await self.graph_tools.search_similar_nodes(**arguments, user_id=user_id)
+                    elif function_name == "upsert_node":
+                        tool_result = await self.graph_tools.upsert_node(**arguments, user_id=user_id)
+                    elif function_name == "create_relationship":
+                        tool_result = await self.graph_tools.create_relationship(**arguments)
+                    else:
+                        tool_result = f"Error: Unknown function {function_name}"
+                    
+                    # Add tool result to message history
+                    messages.append({
+                        "role": "tool",
+                        "content": tool_result,
+                        "tool_call_id": tool_call["id"]
+                    })
+                    
+                    logger.info(f"✓ Tool result: {tool_result[:100]}...")
+            else:
+                # No more tool calls, agent is done
+                final_content = assistant_message.get("content", "Processing completed")
+                logger.info(f"✅ Agent loop completed after {step} steps: {final_content}")
+                
+                return {
+                    "reasoning": final_content,
+                    "steps": step
+                }
+        
+        # Max steps reached
+        logger.warning(f"⚠️ Agent loop reached max steps ({max_steps})")
+        return {
+            "reasoning": "Agent loop reached maximum steps limit",
+            "steps": max_steps
+        }
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(httpx.RequestError),
+        reraise=True
+    )
+    async def _call_openai_with_tools(
+        self, 
+        messages: list[dict], 
+        tools: list[dict]
+    ) -> dict[str, Any]:
+        """Make API call to OpenAI with tools support."""
+        if not settings.openai_api_key:
+            raise Exception("OpenAI API key not configured")
+        
+        headers = {
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "max_tokens": 1000,
+            "temperature": 0.1
+        }
+        
+        try:
+            response = await self.http_client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=30.0
+            )
+            response.raise_for_status()
+            
+            return response.json()
+        
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                logger.warning("OpenAI API rate limit hit, retrying...")
+                raise  # Will be retried by tenacity
+            else:
+                logger.error(
+                    f"OpenAI API error {e.response.status_code}: {e.response.text}"
+                )
+                raise Exception(
+                    f"API error: {e.response.status_code}"
+                ) from e
+        
+        except (httpx.RequestError, json.JSONDecodeError) as e:
+            logger.error(f"Request failed: {str(e)}")
+            raise Exception(f"Request failed: {str(e)}") from e
 
     async def cleanup(self) -> None:
         """Cleanup semantic processor resources."""
-        if self.semantic_store:
-            # SemanticMemoryStore cleanup handled by context manager
-            pass
+        if self.http_client:
+            await self.http_client.aclose()
         logger.info("🧹 Semantic processor cleaned up")
 
     async def process_job(self, job: MemoryReflectionJob) -> dict[str, Any]:
-        """Process semantic memory for reflection job with intelligent pattern detection."""
+        """Process semantic memory using OpenAI Tool-Use Agent loop."""
         start_time = datetime.utcnow()
         self.processing_count += 1
 
         try:
             logger.debug(f"🕸️ Processing semantic memory for job {job.job_id}")
+            
+            if not self.graph_tools:
+                raise Exception("Graph tools not initialized")
 
-            # Use intelligent extraction with pattern detection
-            async with self.semantic_store:
-                extraction_result = await self._extract_with_pattern_detection(
-                    user_id=job.user_id,
-                    user_message=job.user_message,
-                    assistant_response=job.assistant_response,
-                )
+            # Execute the agent loop
+            result = await self._execute_agent_loop(
+                user_id=job.user_id,
+                user_message=job.user_message,
+                assistant_response=job.assistant_response,
+            )
 
-                if extraction_result.get("skip_semantic"):
-                    # Decision to skip semantic storage entirely
-                    self.success_count += 1
-                    processing_time = (
-                        datetime.utcnow() - start_time
-                    ).total_seconds() * 1000
+            self.success_count += 1
+            processing_time = (
+                datetime.utcnow() - start_time
+            ).total_seconds() * 1000
 
-                    logger.info(
-                        f"📋 Semantic storage skipped for job {job.job_id}: {extraction_result.get('reasoning', 'Pattern-based decision')} in {processing_time:.1f}ms"
-                    )
+            logger.info(
+                f"✅ Semantic processing completed for job {job.job_id} in {processing_time:.1f}ms"
+            )
 
-                    return {
-                        "status": "skipped",
-                        "result_id": f"semantic_skip_{job.job_id}",
-                        "entities_extracted": 0,
-                        "relationships_extracted": 0,
-                        "reasoning": extraction_result.get("reasoning"),
-                        "processing_time_ms": processing_time,
-                    }
-
-                # Extract approved entities and relationships
-                entities = extraction_result.get("entities", [])
-                relationships = extraction_result.get("relationships", [])
-
-                # Store in knowledge graph using existing interface
-                if entities or relationships:
-                    final_result = (
-                        await self._store_approved_entities_and_relationships(
-                            entities=entities,
-                            relationships=relationships,
-                            user_id=job.user_id,
-                        )
-                    )
-                else:
-                    final_result = {"entities": [], "relationships": []}
-
-                entity_count = len(final_result.get("entities", []))
-                relationship_count = len(final_result.get("relationships", []))
-
-                self.success_count += 1
-                processing_time = (
-                    datetime.utcnow() - start_time
-                ).total_seconds() * 1000
-
-                logger.info(
-                    f"✅ Semantic processing completed for job {job.job_id}: {entity_count} entities, {relationship_count} relationships in {processing_time:.1f}ms"
-                )
-
-                return {
-                    "status": "stored",
-                    "result_id": f"semantic_{entity_count}_{relationship_count}",
-                    "entities_extracted": entity_count,
-                    "relationships_extracted": relationship_count,
-                    "entities": [
-                        {"name": e.get("name"), "type": e.get("entity_type")}
-                        for e in final_result.get("entities", [])
-                    ],
-                    "relationships": [
-                        {
-                            "from": r.get("from_entity_id"),
-                            "to": r.get("to_entity_id"),
-                            "type": r.get("relationship_type"),
-                        }
-                        for r in final_result.get("relationships", [])
-                    ],
-                    "reasoning": extraction_result.get("reasoning"),
-                    "processing_time_ms": processing_time,
-                }
+            return {
+                "status": "completed",
+                "result_id": f"semantic_{job.job_id}",
+                "reasoning": result.get("reasoning", "Agent processing completed"),
+                "processing_time_ms": processing_time,
+                "agent_steps": result.get("steps", 0),
+            }
 
         except Exception as e:
             self.error_count += 1
@@ -131,470 +348,7 @@ class SemanticProcessor:
             )
             raise
 
-    async def _extract_with_pattern_detection(
-        self, user_id: str, user_message: str, assistant_response: str
-    ) -> dict[str, Any]:
-        """Use LLM to intelligently decide what should go to semantic memory."""
 
-        # Get existing context for pattern detection
-        existing_context = await self._get_existing_graph_context(user_id)
-        recent_episodes = await self._get_recent_episodes(user_id)
-
-        # Enhanced LLM prompt for semantic memory curation
-        pattern_detection_prompt = f"""
-You are a knowledge graph curator for a personal AI assistant. Analyze this conversation and decide what should be stored as SEMANTIC KNOWLEDGE (permanent facts in knowledge graph) vs kept only as EPISODIC MEMORY (temporary experiences).
-
-CONVERSATION:
-User: {user_message}
-Assistant: {assistant_response}
-
-EXISTING SEMANTIC KNOWLEDGE:
-{existing_context}
-
-RECENT EPISODES (for pattern detection):
-{recent_episodes}
-
-SPECIAL RULE - USER IDENTITY RULE:
-The speaker is ALWAYS the entity 'User'. If the user reveals their name (e.g., 'I am Nir'), add this as a PROPERTY to the 'User' entity (e.g., name: 'Nir'). DO NOT create a separate entity for the name.
-
-DECISION RULES:
-✅ SEMANTIC (store in knowledge graph):
-- Personal identifiers: names, relationships, demographic facts
-- Established preferences with clear evidence or explicit statements  
-- Factual information about people, places, organizations
-- Confirmed patterns (3+ mentions of same preference/behavior)
-
-❌ EPISODIC ONLY (skip semantic storage):
-- Single events/activities without preference patterns
-- Unconfirmed preferences from isolated mentions
-- Temporary states or one-off experiences
-- Activities that don't reveal established patterns
-
-EXAMPLES:
-"My mom's name is Varda" → SEMANTIC (family relationship fact)
-"I love Italian food" → SEMANTIC (explicit preference)  
-"Had lunch at Italian restaurant downtown" → EPISODIC (single event, no pattern evidence)
-Third mention of enjoying Italian cuisine → SEMANTIC (pattern confirmed)
-"My name is Nir" → SEMANTIC Entities: [{{"name": "User", "type": "USER", "properties": {{"name": "Nir"}}}}]
-
-RELATIONSHIP TYPES - Use specific, meaningful relationship names from these categories:
-Family: HAS_MOTHER, HAS_FATHER, HAS_SIBLING, HAS_CHILD, HAS_SPOUSE, HAS_PARTNER
-Work: WORKS_AT, MANAGES, REPORTS_TO, COLLEAGUE_OF
-Location: LIVES_IN, BORN_IN, VISITED, WORKS_IN, STUDIED_IN
-Preferences: LIKES, DISLIKES, PREFERS, ENJOYS, AVOIDS, LOVES, HATES
-Skills: HAS_SKILL, KNOWS_ABOUT, EXPERT_IN, LEARNING, TAUGHT_BY
-Social: KNOWS, FRIEND_OF, MENTOR_OF, STUDENT_OF
-Ownership: OWNS, HAS_GOAL, HAS_ALLERGY
-General: RELATED_TO, PART_OF, ASSOCIATED_WITH, MENTIONED_IN
-
-Examples:
-"My sister Tal" → HAS_SIBLING (User → HAS_SIBLING → Tal)
-"Tal loves cooking" → ENJOYS (Tal → ENJOYS → cooking)
-"I work at Google" → WORKS_AT (User → WORKS_AT → Google)
-
-Choose the MOST SPECIFIC relationship type. Avoid generic RELATED_TO unless no specific type applies.
-
-Analyze the conversation and return JSON:
-{{
-    "skip_semantic": true/false,
-    "entities": [
-        {{
-            "name": "entity_name",
-            "type": "entity_type", 
-            "confidence": 0.8,
-            "properties": {{"key": "value"}}
-        }}
-    ],
-    "relationships": [
-        {{
-            "from_entity": "entity_name",
-            "to_entity": "entity_name", 
-            "relationship": "specific_relationship_type",
-            "confidence": 0.9
-        }}
-    ],
-    "reasoning": "Explanation of decision - why semantic storage or episodic only"
-}}
-
-If skip_semantic is true, return empty entities and relationships arrays.
-Focus on permanent facts and established patterns, not temporary experiences.
-"""
-
-        try:
-            # Import here to avoid circular imports
-            from ...memory.services.summarizer import ConversationSummarizer
-
-            # Use existing summarizer for LLM calls
-            summarizer = ConversationSummarizer()
-            response = await summarizer._call_openai(
-                pattern_detection_prompt, max_tokens=1000
-            )
-
-            # Parse JSON response
-            import json
-            import re
-
-            try:
-                data = json.loads(response)
-            except json.JSONDecodeError:
-                # Try to extract JSON from response
-                json_match = re.search(r"\{.*\}", response, re.DOTALL)
-                if json_match:
-                    data = json.loads(json_match.group())
-                else:
-                    # Fallback to processing everything
-                    logger.warning(
-                        f"Could not parse LLM pattern detection response, falling back to full extraction"
-                    )
-                    return await self._fallback_to_full_extraction(
-                        user_id, user_message, assistant_response
-                    )
-
-            logger.info(
-                f"🧠 Pattern detection decision: {data.get('reasoning', 'No reasoning provided')}"
-            )
-            return data
-
-        except Exception as e:
-            logger.warning(
-                f"Pattern detection failed: {e}, falling back to full extraction"
-            )
-            return await self._fallback_to_full_extraction(
-                user_id, user_message, assistant_response
-            )
-
-    async def _get_existing_graph_context(self, user_id: str) -> str:
-        """Get existing knowledge graph context for pattern detection."""
-        try:
-            # Get sample of existing entities and relationships
-            entities = await self.semantic_store.get_entities_for_user(user_id)
-            relationships = await self.semantic_store.get_relationships_for_user(
-                user_id
-            )
-
-            if not entities and not relationships:
-                return "No existing semantic knowledge - this is the first analysis for this user."
-
-            # Format for context
-            context_parts = []
-
-            if entities:
-                context_parts.append("EXISTING ENTITIES:")
-                for entity in entities[:5]:  # Show up to 5 entities
-                    entity_type = entity.get("type", "Unknown")
-                    entity_name = entity.get("name", "Unknown")
-                    context_parts.append(f"- {entity_type}({entity_name})")
-
-            if relationships:
-                context_parts.append("\nEXISTING RELATIONSHIPS:")
-                for rel in relationships[:5]:  # Show up to 5 relationships
-                    from_entity = rel.get("from_entity", "Unknown")
-                    to_entity = rel.get("to_entity", "Unknown")
-                    rel_type = rel.get("relationship_type", "UNKNOWN")
-                    context_parts.append(
-                        f"- ({from_entity})-[{rel_type}]->({to_entity})"
-                    )
-
-            return "\n".join(context_parts)
-
-        except Exception as e:
-            logger.warning(f"Failed to get existing graph context: {e}")
-            return "Unable to retrieve existing knowledge graph context."
-
-    async def _get_recent_episodes(self, user_id: str) -> str:
-        """Get recent episodic memories for pattern detection."""
-        try:
-            from ...memory.tiers.episodic import EpisodicMemoryStore
-
-            async with EpisodicMemoryStore() as episodic_store:
-                episodes = await episodic_store.get_recent_episodes(user_id, limit=5)
-
-            if not episodes:
-                return "No recent episodes found."
-
-            context_parts = ["RECENT EPISODES:"]
-            for i, episode in enumerate(episodes[:3], 1):  # Show 3 most recent
-                content = (
-                    episode.get("content", "Unknown")[:100] + "..."
-                )  # Truncate for context
-                timestamp = episode.get("timestamp", "Unknown time")
-                context_parts.append(f"{i}. ({timestamp[:10]}) {content}")
-
-            return "\n".join(context_parts)
-
-        except Exception as e:
-            logger.warning(f"Failed to get recent episodes: {e}")
-            return "Unable to retrieve recent episodic context."
-
-    async def _fallback_to_full_extraction(
-        self, user_id: str, user_message: str, assistant_response: str
-    ) -> dict[str, Any]:
-        """Fallback to original extraction method if pattern detection fails."""
-        try:
-            extraction_result = await self.semantic_store.extract_and_store_entities(
-                user_id=user_id,
-                user_message=user_message,
-                assistant_response=assistant_response,
-            )
-
-            return {
-                "skip_semantic": False,
-                "entities": [
-                    {"name": e.name, "type": e.entity_type.value, "confidence": 0.7}
-                    for e in extraction_result.entities
-                ],
-                "relationships": [
-                    {
-                        "from_entity": e.from_entity_id,
-                        "to_entity": e.to_entity_id,
-                        "relationship": e.relationship_type.value,
-                        "confidence": 0.7,
-                    }
-                    for e in extraction_result.relationships
-                ],
-                "reasoning": "Fallback to full extraction due to pattern detection failure",
-            }
-        except Exception as e:
-            logger.error(f"Fallback extraction also failed: {e}")
-            return {
-                "skip_semantic": True,
-                "entities": [],
-                "relationships": [],
-                "reasoning": f"Both pattern detection and fallback extraction failed: {e}",
-            }
-
-    async def _store_approved_entities_and_relationships(
-        self, entities: list[dict], relationships: list[dict], user_id: str
-    ) -> dict[str, Any]:
-        """Store approved entities and relationships to knowledge graph with embeddings."""
-
-        from ...core.domain.semantic import EntityType, RelationshipType
-
-        stored_entities = []
-        stored_relationships = []
-
-        try:
-            # Ensure user entity exists (without embedding for User entity)
-            user_entity_id = await self.semantic_store.upsert_entity(
-                user_id=user_id,
-                entity_type=EntityType.USER,
-                entity_name="User",
-                properties={"is_primary_user": True},
-            )
-
-            # Store entities with embeddings
-            for entity_data in entities:
-                entity_type_str = entity_data.get("type", "ENTITY")
-
-                # Map to enum
-                try:
-                    entity_type = EntityType(entity_type_str.upper())
-                except ValueError:
-                    entity_type = EntityType.ENTITY
-
-                # Generate embedding for the entity
-                entity_name = entity_data["name"]
-                entity_properties = entity_data.get("properties", {})
-
-                # Create text for embedding: "name: properties"
-                properties_text = ", ".join(
-                    [
-                        f"{k}: {v}"
-                        for k, v in entity_properties.items()
-                        if k not in ["extraction_method", "confidence"]
-                    ]
-                )
-                embedding_text = (
-                    f"{entity_name}: {properties_text}"
-                    if properties_text
-                    else entity_name
-                )
-
-                # Generate embedding using the semantic store's embedding provider
-                try:
-                    if not self.semantic_store:
-                        raise Exception("Semantic store not available")
-                    async with self.semantic_store.embedding_provider as provider:
-                        embedding = await provider.embed_text(embedding_text)
-                    logger.debug(
-                        f"Generated embedding for entity {entity_name} (dim: {len(embedding)})"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to generate embedding for entity {entity_name}: {e}"
-                    )
-                    embedding = None
-
-                # Store entity with embedding using direct Neo4j query
-                entity_id = await self._upsert_entity_with_embedding(
-                    user_id=user_id,
-                    entity_type=entity_type,
-                    entity_name=entity_name,
-                    properties=entity_properties,
-                    embedding=embedding,
-                )
-
-                stored_entities.append(
-                    {
-                        "name": entity_name,
-                        "entity_type": entity_type.value,
-                        "entity_id": entity_id,
-                        "has_embedding": embedding is not None,
-                    }
-                )
-
-            # Store relationships
-            for rel_data in relationships:
-                relationship_type_str = rel_data.get("relationship", "RELATED_TO")
-
-                # Map to enum
-                try:
-                    relationship_type = RelationshipType(relationship_type_str.upper())
-                except ValueError:
-                    relationship_type = RelationshipType.RELATED_TO
-
-                # Find entity IDs
-                from_name = rel_data["from_entity"]
-                to_name = rel_data["to_entity"]
-
-                # Use user entity ID if from_entity is "User"
-                if from_name.lower() in ["user", "i", "me"]:
-                    from_entity_id = user_entity_id
-                else:
-                    # Find stored entity by name
-                    from_entity = next(
-                        (e for e in stored_entities if e["name"] == from_name), None
-                    )
-                    if not from_entity:
-                        # Create entity if not found
-                        from_entity_id = await self.semantic_store.upsert_entity(
-                            user_id=user_id,
-                            entity_type=EntityType.ENTITY,
-                            entity_name=from_name,
-                            properties={},
-                        )
-                    else:
-                        from_entity_id = from_entity["entity_id"]
-
-                # Same for to_entity
-                to_entity = next(
-                    (e for e in stored_entities if e["name"] == to_name), None
-                )
-                if not to_entity:
-                    to_entity_id = await self.semantic_store.upsert_entity(
-                        user_id=user_id,
-                        entity_type=EntityType.ENTITY,
-                        entity_name=to_name,
-                        properties={},
-                    )
-                else:
-                    to_entity_id = to_entity["entity_id"]
-
-                # Store relationship
-                await self.semantic_store.upsert_relationship(
-                    user_id=user_id,
-                    from_entity_id=from_entity_id,
-                    to_entity_id=to_entity_id,
-                    relationship_type=relationship_type,
-                    weight=rel_data.get("confidence", 0.8),
-                    decay_rate=0.01,
-                    properties=rel_data.get("properties", {}),
-                )
-
-                stored_relationships.append(
-                    {
-                        "from_entity_id": from_entity_id,
-                        "to_entity_id": to_entity_id,
-                        "relationship_type": relationship_type.value,
-                    }
-                )
-
-            return {"entities": stored_entities, "relationships": stored_relationships}
-
-        except Exception as e:
-            logger.error(f"Failed to store approved entities/relationships: {e}")
-            raise
-
-    async def _upsert_entity_with_embedding(
-        self,
-        user_id: str,
-        entity_type,
-        entity_name: str,
-        properties: dict[str, Any],
-        embedding: list[float] | None = None,
-    ) -> str:
-        """Upsert entity with embedding using direct Neo4j query."""
-
-        import uuid
-        from ...core.domain.semantic import EntityType
-
-        # Generate consistent entity ID
-        key = f"{user_id}:{entity_type.value}:{entity_name.lower().strip()}"
-        entity_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
-
-        # Prepare properties with embedding
-        all_properties = {**properties, "extraction_method": "semantic_processor"}
-
-        # Build the MERGE query with embedding support
-        query = f"""
-        MERGE (e:{entity_type.value} {{entity_id: $entity_id, user_id: $user_id}})
-        ON CREATE SET 
-            e.name = $name,
-            e.created_at = datetime(),
-            e.last_updated = datetime(),
-            e += $properties
-        ON MATCH SET 
-            e.name = $name,
-            e.last_updated = datetime(),
-            e += $properties
-        """
-
-        # Add embedding parameter if available
-        parameters = {
-            "entity_id": entity_id,
-            "user_id": user_id,
-            "name": entity_name,
-            "properties": all_properties,
-        }
-
-        # Add embedding to query if available
-        if embedding:
-            query += """
-        SET e.embedding = $embedding
-            """
-            parameters["embedding"] = embedding
-
-        query += """
-        RETURN e.entity_id as entity_id
-        """
-
-        # Execute the query
-        try:
-            if not self.semantic_store or not self.semantic_store.neo4j:
-                raise Exception("Semantic store or Neo4j connection not available")
-            result = await self.semantic_store.neo4j.execute_write_query(
-                query, parameters
-            )
-
-            if not result:
-                raise Exception("Entity upsert returned no results")
-
-            logger.debug(
-                f"Upserted entity {entity_id} with embedding: {embedding is not None}"
-            )
-            return entity_id
-
-        except Exception as e:
-            logger.error(f"Failed to upsert entity {entity_name} with embedding: {e}")
-            # Fallback to standard upsert without embedding
-            if not self.semantic_store:
-                raise Exception("Semantic store not available for fallback")
-            return await self.semantic_store.upsert_entity(
-                user_id=user_id,
-                entity_type=entity_type,
-                entity_name=entity_name,
-                properties=all_properties,
-            )
 
     def get_health(self) -> dict[str, Any]:
         """Get processor health metrics."""
@@ -606,5 +360,5 @@ Focus on permanent facts and established patterns, not temporary experiences.
             "successful": self.success_count,
             "errors": self.error_count,
             "success_rate": success_rate,
-            "store_initialized": self.semantic_store is not None,
+            "graph_tools_initialized": self.graph_tools is not None,
         }
