@@ -6,6 +6,7 @@ intent, extract requirements, and determine if tool usage is needed.
 
 import json
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -218,8 +219,6 @@ Determine if the user is asking about information that might not be present in t
             data = json.loads(response)
         except json.JSONDecodeError:
             # Try to extract JSON from response
-            import re
-
             json_match = re.search(r"\{.*\}", response, re.DOTALL)
             if json_match:
                 data = json.loads(json_match.group())
