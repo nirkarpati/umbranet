@@ -8,6 +8,7 @@ from .weather_tools import get_weather, get_forecast
 from .communication_tools import send_email, send_sms
 from .data_tools import search_web, calculate
 from .file_tools import read_file, write_file
+from .memory_tools import search_episodic_memory, save_episodic_memory
 
 __all__ = [
     "get_weather",
@@ -17,5 +18,7 @@ __all__ = [
     "search_web",
     "calculate",
     "read_file",
-    "write_file"
+    "write_file",
+    "search_episodic_memory",
+    "save_episodic_memory"
 ]

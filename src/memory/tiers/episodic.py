@@ -82,6 +82,78 @@ class EpisodicMemoryStore:
         """
         return f"User: {user_message}\nAssistant: {assistant_response}"
     
+    async def log_episode(
+        self,
+        user_id: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+        timestamp: datetime | None = None
+    ) -> str:
+        """Log a generic episode to episodic memory.
+        
+        This method allows saving arbitrary content (observations, facts, etc.)
+        without forcing it into the user/assistant conversation format.
+        
+        Args:
+            user_id: User identifier
+            content: The content to save
+            metadata: Optional metadata
+            timestamp: Optional custom timestamp for when the event occurred.
+                      If None, uses current UTC time for storage time.
+            
+        Returns:
+            UUID of the logged episode
+            
+        Raises:
+            EpisodicMemoryError: If logging fails
+        """
+        if not self.postgres:
+            raise EpisodicMemoryError("Store not connected - use async context manager")
+        
+        try:
+            # Prepare metadata with temporal grounding information
+            full_metadata = metadata or {}
+            
+            # Use provided timestamp or current time
+            storage_timestamp = datetime.utcnow()  # Always use current time for storage
+            
+            # If custom timestamp provided, store the occurrence time in metadata
+            if timestamp:
+                full_metadata["occurred_at"] = timestamp.isoformat()
+                # Enhance content with temporal context for better vector grounding
+                date_str = timestamp.strftime("%Y-%m-%d")
+                content = f"[Date: {date_str}] {content}"
+            
+            # Generate embedding from the potentially enhanced content
+            async with self.embedding_provider as provider:
+                embedding = await provider.embed_text(content)
+            
+            # Store in database
+            episode_id = str(uuid.uuid4())
+            
+            query = """
+                INSERT INTO episodic_logs 
+                (id, user_id, timestamp, content, embedding, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """
+            
+            await self.postgres.execute_query(
+                query,
+                episode_id,
+                user_id,
+                storage_timestamp,
+                content,
+                str(embedding),  # Convert list to string representation for pgvector
+                json.dumps(full_metadata)
+            )
+            
+            logger.debug(f"Logged episode {episode_id} for user {user_id}")
+            return episode_id
+            
+        except Exception as e:
+            logger.error(f"Failed to log episode for user {user_id}: {str(e)}")
+            raise EpisodicMemoryError(f"Episode logging failed: {str(e)}") from e
+
     async def log_interaction(
         self,
         user_id: str,
@@ -106,43 +178,9 @@ class EpisodicMemoryStore:
         Raises:
             EpisodicMemoryError: If logging fails
         """
-        if not self.postgres:
-            raise EpisodicMemoryError("Store not connected - use async context manager")
-        
-        try:
-            # Format content for embedding
-            content = self._format_interaction_content(user_message, assistant_response)
-            
-            # Generate embedding
-            async with self.embedding_provider as provider:
-                embedding = await provider.embed_text(content)
-            
-            # Store in database
-            episode_id = str(uuid.uuid4())
-            timestamp = datetime.utcnow()
-            
-            query = """
-                INSERT INTO episodic_logs 
-                (id, user_id, timestamp, content, embedding, metadata)
-                VALUES ($1, $2, $3, $4, $5, $6)
-            """
-            
-            await self.postgres.execute_query(
-                query,
-                episode_id,
-                user_id,
-                timestamp,
-                content,
-                str(embedding),  # Convert list to string representation for pgvector
-                json.dumps(metadata or {})
-            )
-            
-            logger.debug(f"Logged episode {episode_id} for user {user_id}")
-            return episode_id
-            
-        except Exception as e:
-            logger.error(f"Failed to log interaction for user {user_id}: {str(e)}")
-            raise EpisodicMemoryError(f"Logging failed: {str(e)}") from e
+        # Format content for embedding and delegate to log_episode
+        content = self._format_interaction_content(user_message, assistant_response)
+        return await self.log_episode(user_id, content, metadata)
     
     async def recall(
         self,
@@ -294,10 +332,14 @@ class EpisodicMemoryStore:
             return 0
             
         except Exception as e:
-            logger.error(f"Failed to get interaction count for user {user_id}: {str(e)}")
+            logger.error(
+                f"Failed to get interaction count for user {user_id}: {str(e)}"
+            )
             return 0
     
-    async def get_recent_episodes(self, user_id: str, limit: int = 10) -> list[dict]:
+    async def get_recent_episodes(
+        self, user_id: str, limit: int = 10
+    ) -> list[dict]:
         """Get recent episodes for a user.
         
         Args:
@@ -324,9 +366,15 @@ class EpisodicMemoryStore:
             
             for row in rows or []:  # Add null safety like get_recent_interactions
                 episodes.append({
-                    "content": row['content'],  # Use dictionary access like working method
-                    "timestamp": row['timestamp'].isoformat() if row['timestamp'] else "",
-                    "metadata": json.loads(row['metadata']) if row['metadata'] else {}  # Parse JSON metadata
+                    "content": row['content'],  # Use dictionary access
+                    "timestamp": (
+                        row['timestamp'].isoformat() 
+                        if row['timestamp'] else ""
+                    ),
+                    "metadata": (
+                        json.loads(row['metadata']) 
+                        if row['metadata'] else {}
+                    )  # Parse JSON metadata
                 })
             
             return episodes
