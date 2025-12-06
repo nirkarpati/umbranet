@@ -9,8 +9,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from ...core.domain.memory import ConversationTurn
 from ...core.domain.state import GovernorState
 from ...memory.tiers.procedural import ProceduralMemoryStore
+from ...memory.tiers.short_term import ShortTermMemoryClient
 
 
 @dataclass
@@ -80,24 +82,33 @@ class ContextAssembler:
         # Gather context data in parallel for performance
         try:
             async with self.procedural_memory as proc_store:
-                # Parallel retrieval of context components
+                # Parallel retrieval of context components including Redis
                 persona_task = asyncio.create_task(
                     self._get_persona(user_id, proc_store)
                 )
                 environment_task = asyncio.create_task(
                     self._get_environment_context(user_id, proc_store)
                 )
-                # Lightweight short-term memory only (no expensive multi-tier recall)
-                short_term_memory = self._get_short_term_memory(state)
+                # Fetch short-term memory from Redis directly
+                memory_task = asyncio.create_task(
+                    self._get_memory_context(user_id)
+                )
                 tasks_task = asyncio.create_task(self._get_active_tasks(user_id, state))
                 instructions_task = asyncio.create_task(
                     self._get_relevant_instructions(user_id, current_input, proc_store)
                 )
 
-                # Wait for context components (excluding memory_task)
-                persona, environment, tasks, instructions = await asyncio.gather(
+                # Wait for all context components
+                (
+                    persona,
+                    environment,
+                    memory,
+                    tasks,
+                    instructions,
+                ) = await asyncio.gather(
                     persona_task,
                     environment_task,
+                    memory_task,
                     tasks_task,
                     instructions_task,
                     return_exceptions=True,
@@ -108,14 +119,24 @@ class ContextAssembler:
                     persona = self._get_default_persona()
                 if isinstance(environment, Exception):
                     environment = self._get_default_environment()
+                if isinstance(memory, Exception):
+                    # Return empty memory structure with error flag
+                    memory = {
+                        "recent_conversation": [],
+                        "conversation_length": 0,
+                        "session_age_minutes": 0.0,
+                        "conversation_topics": ["general"],
+                        "session_summary": "Memory unavailable",
+                        "error": f"Memory fetch failed: {str(memory)}",
+                    }
                 if isinstance(tasks, Exception):
                     tasks = []
                 if isinstance(instructions, Exception):
                     instructions = []
 
                 # Add instructions to memory context
-                if instructions:
-                    short_term_memory["relevant_instructions"] = [
+                if instructions and isinstance(memory, dict):
+                    memory["relevant_instructions"] = [
                         {
                             "title": instr.instruction.title,
                             "instruction": instr.instruction.instruction,
@@ -128,7 +149,7 @@ class ContextAssembler:
                 return ContextData(
                     persona=persona,
                     environment=environment,
-                    memory=short_term_memory,
+                    memory=memory,
                     tasks=tasks,
                     metadata={
                         "user_id": user_id,
@@ -142,8 +163,19 @@ class ContextAssembler:
                     },
                 )
         except Exception as e:
-            # Fallback to default context if procedural memory fails
-            short_term_memory = self._get_short_term_memory(state)
+            # Fallback to minimal context if everything fails
+            try:
+                memory = await self._get_memory_context(user_id)
+            except Exception:
+                memory = {
+                    "recent_conversation": [],
+                    "conversation_length": 0,
+                    "session_age_minutes": 0.0,
+                    "conversation_topics": ["general"],
+                    "session_summary": "Memory unavailable",
+                    "error": "Memory fetch failed",
+                }
+            
             try:
                 tasks = await self._get_active_tasks(user_id, state)
             except Exception:
@@ -152,7 +184,7 @@ class ContextAssembler:
             return ContextData(
                 persona=self._get_default_persona(),
                 environment=self._get_default_environment(),
-                memory=short_term_memory,
+                memory=memory,
                 tasks=tasks,
                 metadata={
                     "user_id": user_id,
@@ -165,6 +197,65 @@ class ContextAssembler:
                     "procedural_memory_error": str(e),
                 },
             )
+
+    async def _get_memory_context(self, user_id: str) -> dict[str, Any]:
+        """Fetch short-term memory context directly from Redis.
+
+        Args:
+            user_id: User identifier
+
+        Returns:
+            Short-term memory context dictionary
+        """
+        async with ShortTermMemoryClient() as stm:
+            context = await stm.get_context(user_id)
+            recent_messages = context.recent_messages
+            
+            return self._format_short_term_memory(recent_messages)
+
+    def _format_short_term_memory(
+        self, recent_messages: list[ConversationTurn]
+    ) -> dict[str, Any]:
+        """Format conversation turns into dictionary structure expected by _build_prompt.
+
+        Args:
+            recent_messages: List of ConversationTurn objects from Redis
+
+        Returns:
+            Formatted short-term memory context dictionary
+        """
+        # Convert ConversationTurn objects to the expected format
+        formatted_messages = []
+        for turn in recent_messages:
+            formatted_messages.extend([
+                {
+                    "role": "user",
+                    "content": turn.user_message,
+                    "timestamp": turn.timestamp.isoformat(),
+                    "metadata": turn.metadata
+                },
+                {
+                    "role": "assistant", 
+                    "content": turn.assistant_response,
+                    "timestamp": turn.timestamp.isoformat(),
+                    "metadata": turn.metadata
+                }
+            ])
+
+        # Calculate session age from last message if available
+        session_age_minutes = 0.0
+        if recent_messages:
+            last_turn = recent_messages[-1]
+            time_diff = datetime.utcnow() - last_turn.timestamp
+            session_age_minutes = time_diff.total_seconds() / 60
+
+        return {
+            "recent_conversation": formatted_messages,
+            "conversation_length": len(recent_messages) * 2,  # user + assistant
+            "session_age_minutes": session_age_minutes,
+            "conversation_topics": self._extract_topics(recent_messages),
+            "session_summary": f"Active session with {len(recent_messages)} turns",
+        }
 
     async def _get_persona(
         self, user_id: str, proc_store: ProceduralMemoryStore
@@ -189,7 +280,9 @@ class ContextAssembler:
             customizations = []
 
             # Communication style
-            comm_style = profile.get_value("communication", "style", "professional")
+            comm_style = profile.get_value(
+                "communication", "style", "professional"
+            )
             if comm_style == "casual":
                 customizations.append("- Use casual, friendly language and tone")
             elif comm_style == "formal":
@@ -197,14 +290,16 @@ class ContextAssembler:
                     "- Use formal, professional language at all times"
                 )
 
-            # Response format preferences
+            # Response format preferences  
             format_pref = profile.get_value(
                 "preferences", "response_format", "balanced"
             )
             if format_pref == "brief":
                 customizations.append("- Keep responses concise and to the point")
             elif format_pref == "detailed":
-                customizations.append("- Provide detailed explanations and context")
+                customizations.append(
+                    "- Provide detailed explanations and context"
+                )
 
             # User name personalization
             name = profile.get_value("personal", "name")
@@ -295,31 +390,6 @@ INTERACTION STYLE:
             "day_of_week": now.strftime("%A"),
             "time_period": self._get_time_period(now.hour),
             "system_load": "normal",
-        }
-
-    def _get_short_term_memory(self, state: GovernorState) -> dict[str, Any]:
-        """Get short-term memory context only (recent conversation from working memory).
-
-        Args:
-            state: Current state containing conversation history
-
-        Returns:
-            Short-term memory context dictionary with recent conversation only
-        """
-        # Extract recent conversation history from state (working memory only)
-        recent_messages = []
-        if hasattr(state, "conversation_history") and state.conversation_history:
-            # Get last 10 messages for immediate context
-            recent_messages = state.conversation_history[-10:]
-
-        return {
-            "recent_conversation": recent_messages,
-            "conversation_length": len(state.conversation_history)
-            if hasattr(state, "conversation_history")
-            else 0,
-            "session_age_minutes": self._calculate_session_age(state),
-            "conversation_topics": self._extract_topics(recent_messages),
-            "session_summary": self._generate_session_summary(state),
         }
 
     async def _get_active_tasks(
@@ -450,6 +520,22 @@ INTERACTION STYLE:
                         f"{', '.join(context_data.memory['conversation_topics'])}"
                     ),
                     "",
+                ]
+            )
+            
+            # Inject actual conversation transcript
+            recent_messages = context_data.memory["recent_conversation"]
+            if recent_messages:
+                prompt_parts.append("CONVERSATION TRANSCRIPT:")
+                for message in recent_messages:
+                    if message.get("role") == "user":
+                        prompt_parts.append(f"User: {message['content']}")
+                    elif message.get("role") == "assistant":
+                        prompt_parts.append(f"Assistant: {message['content']}")
+                prompt_parts.append("")
+            
+            prompt_parts.extend(
+                [
                     "MEMORY TOOLS AVAILABLE:",
                     (
                         "- You have access to 'search_episodic_memory' and "
@@ -523,24 +609,11 @@ INTERACTION STYLE:
         else:
             return "night"
 
-    def _calculate_session_age(self, state: GovernorState) -> float:
-        """Calculate session age in minutes.
+    def _extract_topics(self, turns: list[ConversationTurn]) -> list[str]:
+        """Extract conversation topics from ConversationTurn objects.
 
         Args:
-            state: Governor state
-
-        Returns:
-            Session age in minutes
-        """
-        if hasattr(state, "created_at") and state.created_at:
-            return (datetime.utcnow() - state.created_at).total_seconds() / 60
-        return 0.0
-
-    def _extract_topics(self, messages: list[dict[str, Any]]) -> list[str]:
-        """Extract conversation topics from recent messages.
-
-        Args:
-            messages: List of conversation messages
+            turns: List of ConversationTurn objects
 
         Returns:
             List of extracted topics
@@ -548,48 +621,29 @@ INTERACTION STYLE:
         # Simple topic extraction (could be enhanced with NLP)
         topics = set()
 
-        for message in messages[-5:]:  # Last 5 messages
-            # Handle both dict and ConversationTurn objects
-            if hasattr(message, 'content'):
-                content = message.content.lower()
-            else:
-                content = message.get("content", "").lower()
+        for turn in turns[-3:]:  # Last 3 conversation turns
+            # Extract from both user and assistant messages
+            user_content = turn.user_message.lower()
+            assistant_content = turn.assistant_response.lower()
+            combined_content = f"{user_content} {assistant_content}"
 
             # Basic keyword extraction
-            if "weather" in content:
+            if "weather" in combined_content:
                 topics.add("weather")
-            if "email" in content:
+            if "email" in combined_content:
                 topics.add("email")
-            if "search" in content:
+            if "search" in combined_content:
                 topics.add("search")
-            if "file" in content:
+            if "file" in combined_content:
                 topics.add("files")
-            if "calculate" in content or "math" in content:
+            if "calculate" in combined_content or "math" in combined_content:
                 topics.add("calculations")
+            if "memory" in combined_content or "remember" in combined_content:
+                topics.add("memory")
+            if "schedule" in combined_content or "appointment" in combined_content:
+                topics.add("scheduling")
 
         return list(topics) if topics else ["general"]
-
-    def _generate_session_summary(self, state: GovernorState) -> str:
-        """Generate a brief session summary.
-
-        Args:
-            state: Governor state
-
-        Returns:
-            Session summary string
-        """
-        tools_executed = getattr(state, "total_tools_executed", 0)
-        turns = getattr(state, "total_turns", 0)
-        errors = getattr(state, "error_count", 0)
-
-        if turns == 0:
-            return "New session started"
-        elif tools_executed == 0:
-            return f"Active conversation ({turns} exchanges, no tools used)"
-        else:
-            return (
-                f"Productive session ({tools_executed} tools executed, {errors} errors)"
-            )
 
     def clear_cache(self) -> None:
         """Clear all cached context data."""

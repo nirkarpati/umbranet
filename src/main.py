@@ -82,13 +82,12 @@ async def process_governor_workflow(
         
         tool_registry = ToolRegistry()
         
-        # Use global enhanced context assembler
-        global enhanced_context_assembler
-        if enhanced_context_assembler is None:
-            logger.error(f"❌ [REQ-{request_id}] Enhanced context assembler not initialized")
-            raise RuntimeError("Memory system not properly initialized")
+        # Initialize lightweight context assembler
+        from src.governor.context.assembler import ContextAssembler
         
-        logger.debug(f"⚙️  [REQ-{request_id}] Using enhanced context assembler with memory integration")
+        context_assembler = ContextAssembler()
+        
+        logger.debug(f"⚙️  [REQ-{request_id}] Using lightweight context assembler with memory integration")
         
         # Step 1: Update state with new input
         existing_state.total_turns += 1
@@ -104,7 +103,7 @@ async def process_governor_workflow(
         # Step 3: Assemble context from all memory tiers using enhanced assembler
         logger.info(f"🧠 [REQ-{request_id}] Assembling context from RAG++ memory hierarchy...")
         try:
-            context_prompt = await enhanced_context_assembler.assemble_context(
+            context_prompt = await context_assembler.assemble_context(
                 user_id=event.user_id,
                 current_input=event.content,
                 state=existing_state,
@@ -384,15 +383,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("   ✅ LangGraph workflow loaded successfully")
         
         logger.debug("   • Initializing RAG++ Memory Manager...")
-        global memory_manager, enhanced_context_assembler
+        global memory_manager
         
         # Initialize memory manager
         memory_manager = await get_memory_manager()
         logger.info("   ✅ RAG++ Memory Manager initialized with 4-tier hierarchy")
         
-        # Initialize enhanced context assembler
-        # Enhanced context assembler removed - using lightweight assembler in governor/context/assembler.py
-        logger.info("   ✅ Enhanced Context Assembler initialized")
+        # Context assembler is now initialized per-request as lightweight object
+        logger.info("   ✅ Context Assembler configured for per-request initialization")
         
         logger.debug("   • Setting up session management...")
         logger.info("   ✅ Session storage initialized")
