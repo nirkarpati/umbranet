@@ -832,6 +832,11 @@ const App: React.FC = () => {
   const [memoryData, setMemoryData] = useState<MemoryData | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  
+  // Message history navigation state
+  const [messageHistory, setMessageHistory] = useState<string[]>([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+  const [currentInput, setCurrentInput] = useState('');
 
   // Initialize user ID from localStorage or show input
   useEffect(() => {
@@ -923,6 +928,17 @@ const App: React.FC = () => {
       timestamp: new Date().toISOString(),
     };
 
+    // Add to message history for arrow key navigation
+    setMessageHistory(prev => {
+      const newHistory = [...prev, inputValue.trim()];
+      // Keep last 50 messages in history
+      return newHistory.slice(-50);
+    });
+    
+    // Reset history navigation state
+    setHistoryIndex(-1);
+    setCurrentInput('');
+
     setMessages(prev => [...prev, userMessage]);
     setInputValue('');
     setIsLoading(true);
@@ -979,11 +995,57 @@ const App: React.FC = () => {
     }
   };
 
-  const handleKeyPress = (e: React.KeyboardEvent) => {
+  const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
+      return;
     }
+
+    // Handle arrow key navigation through message history
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (messageHistory.length === 0) return;
+      
+      // Save current input if we're starting to navigate
+      if (historyIndex === -1) {
+        setCurrentInput(inputValue);
+      }
+      
+      const newIndex = Math.min(historyIndex + 1, messageHistory.length - 1);
+      setHistoryIndex(newIndex);
+      setInputValue(messageHistory[messageHistory.length - 1 - newIndex]);
+      return;
+    }
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (historyIndex === -1) return; // Not in history navigation mode
+      
+      const newIndex = historyIndex - 1;
+      if (newIndex < 0) {
+        // Return to current input
+        setHistoryIndex(-1);
+        setInputValue(currentInput);
+      } else {
+        setHistoryIndex(newIndex);
+        setInputValue(messageHistory[messageHistory.length - 1 - newIndex]);
+      }
+      return;
+    }
+  };
+
+  // Handle regular text input to exit history mode
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const newValue = e.target.value;
+    
+    // If user starts typing and we're in history mode, exit history mode
+    if (historyIndex !== -1) {
+      setHistoryIndex(-1);
+      setCurrentInput('');
+    }
+    
+    setInputValue(newValue);
   };
 
   const handleUserIdSubmit = (inputUserId: string) => {
@@ -1000,6 +1062,9 @@ const App: React.FC = () => {
     setShowUserIdInput(true);
     setIsUserIdSet(false);
     setMessages([]); // Clear messages when switching users
+    setMessageHistory([]); // Clear message history
+    setHistoryIndex(-1);
+    setCurrentInput('');
   };
 
   const handleLogout = () => {
@@ -1010,6 +1075,9 @@ const App: React.FC = () => {
     setMessages([]);
     setShowMemoryDashboard(false);
     setMemoryData(null);
+    setMessageHistory([]); // Clear message history
+    setHistoryIndex(-1);
+    setCurrentInput('');
   };
 
   const openMemoryDashboard = () => {
@@ -1134,9 +1202,9 @@ const App: React.FC = () => {
           <textarea
             ref={inputRef}
             value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
-            onKeyPress={handleKeyPress}
-            placeholder="Type your message here... (Press Enter to send)"
+            onChange={handleInputChange}
+            onKeyDown={handleKeyDown}
+            placeholder="Type your message here... (Press Enter to send, ↑↓ for history)"
             className="message-input"
             rows={3}
             disabled={isLoading}
