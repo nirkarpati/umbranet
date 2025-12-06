@@ -5,31 +5,42 @@ intent, extract requirements, and determine if tool usage is needed.
 """
 
 import json
-import re
+import logging
 from typing import Any
 
+import httpx
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+from ...config import settings
 from ...domain.state import GovernorState, StateNode
 from ..base import NodeFunction
+
+logger = logging.getLogger(__name__)
 
 
 class AnalyzeNode(NodeFunction):
     """Node that analyzes user input for intent and tool requirements.
-    
+
     This node uses LLM analysis to understand what the user wants
     and determines the appropriate response strategy.
     """
-    
+
     @property
     def name(self) -> str:
         """Get the node name."""
         return StateNode.ANALYZE.value
-    
+
     async def __call__(self, state: GovernorState) -> GovernorState:
         """Analyze user input and determine response strategy.
-        
+
         Args:
             state: Current workflow state
-            
+
         Returns:
             Updated state with analysis results
         """
@@ -38,233 +49,240 @@ class AnalyzeNode(NodeFunction):
             state.record_error("No user input to analyze")
             state.transition_to(StateNode.RESPOND)
             return state
-        
-        # Perform intent analysis
-        analysis_result = await self._analyze_user_intent(user_input, state)
-        
+
+        # Perform LLM-based intent analysis
+        try:
+            analysis_result = await self._analyze_with_llm(user_input, state)
+        except Exception as e:
+            logger.error(f"LLM analysis failed: {e}")
+            state.record_error(f"Analysis failed: {str(e)}")
+            state.transition_to(StateNode.RESPOND)
+            return state
+
         # Store analysis results in context
-        state.context.update({
-            "analysis": analysis_result,
-            "analysis_completed_at": state.updated_at.isoformat()
-        })
-        
+        state.context.update(
+            {
+                "analysis": analysis_result,
+                "analysis_completed_at": state.updated_at.isoformat(),
+            }
+        )
+
         # Determine next state based on analysis
-        if analysis_result.get("needs_tools", False):
+        if analysis_result.get("needs_retrieval", False):
             state.transition_to(StateNode.TOOL_DECISION)
         else:
             state.transition_to(StateNode.RESPOND)
-        
+
         return state
-    
-    async def _analyze_user_intent(
-        self, 
-        user_input: str, 
-        state: GovernorState
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(httpx.RequestError),
+        reraise=True,
+    )
+    async def _call_openai(self, prompt: str, max_tokens: int = 300) -> str:
+        """Make API call to OpenAI with retry logic."""
+        if not settings.openai_api_key:
+            raise Exception("OpenAI API key not configured")
+
+        headers = {
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        data = {
+            "model": "gpt-4o-mini",  # Efficient model for analysis
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an AI intent classifier. Analyze user input and return "
+                        "structured JSON only. Be precise and consistent."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.1,  # Low temperature for consistency
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers=headers,
+                    json=data,
+                    timeout=30.0,
+                )
+                response.raise_for_status()
+
+                result = response.json()
+                return result["choices"][0]["message"]["content"].strip()
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                logger.warning("OpenAI API rate limit hit, retrying...")
+                raise  # Will be retried by tenacity
+            else:
+                logger.error(
+                    f"OpenAI API error {e.response.status_code}: {e.response.text}"
+                )
+                raise Exception(f"OpenAI API error: {e.response.status_code}") from e
+
+        except (httpx.RequestError, json.JSONDecodeError) as e:
+            logger.error(f"Request failed: {str(e)}")
+            raise Exception(f"Request failed: {str(e)}") from e
+
+    def _get_recent_conversation_summary(self, state: GovernorState) -> str:
+        """Get a summary of recent conversation for context."""
+        if not hasattr(state, "conversation_history") or not state.conversation_history:
+            return "No prior conversation context available."
+
+        # Get last few exchanges
+        recent_messages = state.conversation_history[-3:]
+        summary_parts = []
+
+        for i, turn in enumerate(recent_messages, 1):
+            if hasattr(turn, "user_message") and hasattr(turn, "assistant_response"):
+                summary_parts.append(
+                    f"Exchange {i}: User said '{turn.user_message}', Assistant replied '{turn.assistant_response}'"
+                )
+            elif hasattr(turn, "content"):
+                summary_parts.append(f"Message {i}: {turn.content}")
+
+        return (
+            " | ".join(summary_parts)
+            if summary_parts
+            else "No clear conversation context."
+        )
+
+    async def _analyze_with_llm(
+        self, user_input: str, state: GovernorState
     ) -> dict[str, Any]:
-        """Analyze user input to understand intent.
-        
+        """Analyze user input using LLM for intent classification and tool selection.
+
         Args:
             user_input: The user's message
             state: Current workflow state for context
-            
+
         Returns:
-            Dictionary containing analysis results
+            Dictionary containing structured analysis results
         """
-        # For now, implement rule-based analysis
-        # In production, this would use LLM capabilities
-        
-        # Basic intent detection patterns
-        question_patterns = [
-            r'\b(what|how|where|when|why|who)\b',
-            r'\?',
-            r'\b(explain|tell me|show me)\b'
-        ]
-        
-        action_patterns = [
-            r'\b(send|email|message|call|remind|schedule)\b',
-            r'\b(create|make|generate|build)\b',
-            r'\b(search|find|look up|get)\b',
-            r'\b(calculate|compute|analyze)\b',
-            r'\b(save|store|remember)\b',
-            r'\b(delete|remove|cancel)\b'
-        ]
-        
-        tool_requiring_patterns = [
-            r'\b(weather|temperature|forecast)\b',
-            r'\b(email|send message|contact)\b',
-            r'\b(calendar|schedule|appointment|meeting)\b',
-            r'\b(search|google|lookup)\b',
-            r'\b(file|document|save|open)\b',
-            r'\b(calculate|math|compute)\b'
-        ]
-        
-        input_lower = user_input.lower()
-        
-        # Detect if it's a question
-        is_question = any(re.search(pattern, input_lower) for pattern in question_patterns)
-        
-        # Detect if it's an action request
-        is_action = any(re.search(pattern, input_lower) for pattern in action_patterns)
-        
-        # Detect if tools are likely needed
-        needs_tools = any(re.search(pattern, input_lower) for pattern in tool_requiring_patterns)
-        
-        # Extract potential entities
-        entities = self._extract_entities(user_input)
-        
-        # Determine urgency
-        urgency_indicators = ["urgent", "asap", "immediately", "now", "emergency"]
-        urgency = "high" if any(indicator in input_lower for indicator in urgency_indicators) else "normal"
-        
-        # Analyze sentiment
-        positive_words = ["please", "thanks", "good", "great", "excellent", "perfect"]
-        negative_words = ["problem", "issue", "error", "wrong", "bad", "terrible"]
-        
-        positive_count = sum(1 for word in positive_words if word in input_lower)
-        negative_count = sum(1 for word in negative_words if word in input_lower)
-        
-        if positive_count > negative_count:
-            sentiment = "positive"
-        elif negative_count > positive_count:
-            sentiment = "negative"
-        else:
-            sentiment = "neutral"
-        
-        return {
-            "intent": self._classify_intent(is_question, is_action, needs_tools),
-            "is_question": is_question,
-            "is_action": is_action,
-            "needs_tools": needs_tools,
-            "entities": entities,
-            "urgency": urgency,
-            "sentiment": sentiment,
-            "confidence": self._calculate_confidence(is_question, is_action, needs_tools),
-            "suggested_tools": self._suggest_tools(input_lower),
-            "context_variables": {
-                "user_history_turns": state.total_turns,
-                "session_duration": (state.updated_at - state.created_at).total_seconds(),
-                "error_count": state.error_count
-            }
+        # Get recent conversation context
+        recent_context = self._get_recent_conversation_summary(state)
+
+        # Construct analysis prompt
+        analysis_prompt = f"""Analyze the following user input for intent and determine if memory retrieval tools are needed.
+
+**Current User Input:** "{user_input}"
+
+**Recent Conversation Context:** {recent_context}
+
+**Session Context:**
+- Total conversation turns: {state.total_turns}
+- Session age: {(state.updated_at - state.created_at).total_seconds() / 60:.1f} minutes
+- Error count: {state.error_count}
+
+**Analysis Task:**
+Determine if the user is asking about information that might not be present in the recent conversation context above. Consider if they're referring to:
+- Past events, conversations, or decisions
+- People, places, or facts mentioned previously but not in recent context
+- Historical information or stored knowledge
+- Personal details or preferences from earlier sessions
+
+**Required Output Format (JSON only):**
+{{
+    "intent": "retrieval_needed" | "action_request" | "chat",
+    "needs_retrieval": true | false,
+    "suggested_retrieval_tool": "search_episodic_memory" | "query_knowledge_graph" | null,
+    "reasoning": "Brief explanation of why retrieval is/isn't needed",
+    "confidence": 0.0-1.0,
+    "urgency": "low" | "normal" | "high"
+}}
+
+**Guidelines:**
+- Use "search_episodic_memory" for questions about past conversations, events, or temporal information
+- Use "query_knowledge_graph" for questions about entities, relationships, facts, or structured knowledge
+- Set needs_retrieval=true if user references information not clearly present in recent context
+- Set intent="retrieval_needed" when needs_retrieval=true
+- Set intent="action_request" for requests to do something specific
+- Set intent="chat" for general conversation that doesn't require retrieval
+"""
+
+        # Call LLM for analysis
+        response = await self._call_openai(analysis_prompt)
+
+        # Parse JSON response
+        try:
+            data = json.loads(response)
+        except json.JSONDecodeError:
+            # Try to extract JSON from response
+            import re
+
+            json_match = re.search(r"\{.*\}", response, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+            else:
+                # Fallback to basic analysis
+                logger.warning(f"Could not parse LLM response as JSON: {response}")
+                data = {
+                    "intent": "chat",
+                    "needs_retrieval": False,
+                    "suggested_retrieval_tool": None,
+                    "reasoning": "Failed to parse LLM response, defaulting to chat",
+                    "confidence": 0.5,
+                    "urgency": "normal",
+                }
+
+        # Validate and ensure required fields
+        validated_result = {
+            "intent": data.get("intent", "chat"),
+            "needs_retrieval": data.get("needs_retrieval", False),
+            "suggested_retrieval_tool": data.get("suggested_retrieval_tool"),
+            "reasoning": data.get("reasoning", "No reasoning provided"),
+            "confidence": float(data.get("confidence", 0.7)),
+            "urgency": data.get("urgency", "normal"),
+            "analysis_method": "llm",
+            "session_context": {
+                "total_turns": state.total_turns,
+                "session_duration_minutes": (
+                    state.updated_at - state.created_at
+                ).total_seconds()
+                / 60,
+                "error_count": state.error_count,
+            },
         }
-    
-    def _classify_intent(self, is_question: bool, is_action: bool, needs_tools: bool) -> str:
-        """Classify the user's intent based on analysis."""
-        if is_question and needs_tools:
-            return "information_request"
-        elif is_action and needs_tools:
-            return "action_request" 
-        elif is_question:
-            return "simple_question"
-        elif is_action:
-            return "simple_action"
-        else:
-            return "conversation"
-    
-    def _extract_entities(self, text: str) -> dict[str, list[str]]:
-        """Extract entities from user input."""
-        entities = {}
-        
-        # Email addresses
-        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-        emails = re.findall(email_pattern, text)
-        if emails:
-            entities["emails"] = emails
-        
-        # Phone numbers (simple pattern)
-        phone_pattern = r'\b\d{3}-\d{3}-\d{4}\b|\b\(\d{3}\)\s*\d{3}-\d{4}\b'
-        phones = re.findall(phone_pattern, text)
-        if phones:
-            entities["phones"] = phones
-        
-        # URLs
-        url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
-        urls = re.findall(url_pattern, text)
-        if urls:
-            entities["urls"] = urls
-        
-        # Dates (simple patterns)
-        date_patterns = [
-            r'\b\d{1,2}/\d{1,2}/\d{4}\b',
-            r'\b\d{4}-\d{2}-\d{2}\b',
-            r'\b(today|tomorrow|yesterday)\b'
-        ]
-        dates = []
-        for pattern in date_patterns:
-            dates.extend(re.findall(pattern, text, re.IGNORECASE))
-        if dates:
-            entities["dates"] = dates
-        
-        # Times
-        time_pattern = r'\b\d{1,2}:\d{2}\s*(am|pm|AM|PM)?\b'
-        times = re.findall(time_pattern, text)
-        if times:
-            entities["times"] = [f"{t[0]} {t[1]}".strip() for t in times]
-        
-        return entities
-    
-    def _calculate_confidence(self, is_question: bool, is_action: bool, needs_tools: bool) -> float:
-        """Calculate confidence score for the analysis."""
-        confidence = 0.5  # Base confidence
-        
-        # Increase confidence for clear patterns
-        if is_question:
-            confidence += 0.2
-        if is_action:
-            confidence += 0.2
-        if needs_tools:
-            confidence += 0.1
-        
-        # Cap at 1.0
-        return min(confidence, 1.0)
-    
-    def _suggest_tools(self, input_lower: str) -> list[str]:
-        """Suggest tools that might be useful for this input."""
-        suggested = []
-        
-        tool_mappings = {
-            "weather": ["weather", "temperature", "forecast", "rain", "snow"],
-            "email": ["email", "send message", "contact", "mail"],
-            "calendar": ["calendar", "schedule", "meeting", "appointment", "remind"],
-            "search": ["search", "find", "lookup", "google"],
-            "file_manager": ["file", "document", "save", "open", "folder"],
-            "calculator": ["calculate", "math", "compute", "sum", "multiply"],
-            "web_browser": ["website", "browse", "url", "link"],
-            "timer": ["timer", "alarm", "countdown", "stopwatch"]
-        }
-        
-        for tool, keywords in tool_mappings.items():
-            if any(keyword in input_lower for keyword in keywords):
-                suggested.append(tool)
-        
-        return suggested
+
+        return validated_result
 
 
 class AnalyzeConditional:
     """Conditional routing from analyze state."""
-    
+
     @property
     def name(self) -> str:
         """Get the conditional name."""
         return "analyze_routing"
-    
+
     def __call__(self, state: GovernorState) -> str:
         """Determine next node from analyze state.
-        
+
         Args:
             state: Current workflow state
-            
+
         Returns:
             Next node name
         """
         analysis = state.context.get("analysis", {})
-        
-        # If analysis indicates tools are needed, go to tool decision
-        if analysis.get("needs_tools", False):
+
+        # If analysis indicates retrieval is needed, go to tool decision
+        if analysis.get("needs_retrieval", False):
             return StateNode.TOOL_DECISION.value
-        
+
         # If there's an error during analysis, go to respond with error
         if state.error_count > 0:
             return StateNode.RESPOND.value
-        
+
         # Otherwise, go straight to response generation
         return StateNode.RESPOND.value
